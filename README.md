@@ -107,7 +107,7 @@ uv run python -m app.cli create-template \
   --provider-template-name fazi_student_results_ready_v1 \
   --language en_US \
   --billing-category utility \
-  --parameter-schema '{"body":["parent_name","student_name","term"]}'
+  --parameter-schema '{"body":["parent_name","student_name","term","results_url"]}'
 ```
 
 Only ordered BODY text parameters are supported. Calling applications provide named values; the platform converts them into Meta's positional order. Missing and extra parameters are rejected with HTTP 422. Non-empty header or button schemas are rejected because those component types are not yet implemented.
@@ -124,7 +124,8 @@ curl -X POST http://127.0.0.1:8000/api/v1/messages/template \
     "parameters": {
       "parent_name": "Jane",
       "student_name": "Brian",
-      "term": "Term 2"
+      "term": "Term 2",
+      "results_url": "https://school.example/results/result-001"
     },
     "metadata": {
       "source_type": "student_result",
@@ -145,9 +146,16 @@ pair prevents one application from resolving another application's customer.
 
 Calling applications provide `billing_account` as the tenant's stable external ID.
 They do not calculate prices, mutate balances, know Meta pricing or credentials, or
-select provider template names. Requests that omit `billing_account` remain explicitly
-unbilled legacy/internal traffic for backward compatibility. Historical outbound rows
-are not assigned synthetic accounts.
+select provider template names. Each `MessagingApplication` has an operator-controlled
+`billing_required` policy. It defaults to false so existing and legacy/internal
+applications may continue explicitly unbilled traffic. When true, a new text or
+template request that omits `billing_account` returns HTTP 422 with code
+`billing_account_required`, before any outbound row, reservation, or provider call.
+Historical outbound rows are not assigned synthetic accounts.
+
+Exact idempotent replay is resolved before this policy check. Thus an exact replay of
+a historical unbilled row still returns that row—even if the application later becomes
+billing-required—and never submits it again. A changed payload remains a conflict.
 
 Money is stored as integer minor units. `KES 100.00` is `10000` minor units. KES is
 the only enabled currency in this phase. `wallet_transactions` is the immutable source
@@ -173,9 +181,13 @@ lock BillingAccount
 
 The account-row lock serializes reservations, so active reservations and charges
 cannot exceed prepaid funds. Confirmed provider rejection releases the reservation
-without charging. Timeout or an ID-less/malformed success is `uncertain` and retains
-the reservation. Delivery/read updates and webhook replays do not charge again. There
-is no automatic refund for later delivery failure.
+without charging. A valid HTTP 4xx is confirmed rejection. Read/write timeouts or
+failures, connection resets, remote protocol failures, HTTP 5xx, and ID-less/malformed
+2xx responses are `uncertain` and retain the reservation because acceptance cannot be
+disproved. A connection failure, connect timeout, local connection-pool timeout, or
+local protocol rejection is failed because submission did not reach Meta. Delivery/read
+updates and webhook replays do not charge again. There is no automatic refund for later
+delivery failure.
 
 Insufficient funds return HTTP 402 with `insufficient_messaging_balance` before Meta
 is called. A suspended account returns HTTP 403 without disabling other tenants.
@@ -183,6 +195,11 @@ is called. A suspended account returns HTTP 403 without disabling other tenants.
 Administrative mutations remain local CLI operations:
 
 ```bash
+uv run python -m app.cli list-applications
+uv run python -m app.cli show-application --application school-management
+uv run python -m app.cli require-application-billing --application school-management
+uv run python -m app.cli allow-application-unbilled --application school-management
+
 uv run python -m app.cli create-billing-account \
   --application school-management --external-id <school-uuid> \
   --name "Example Academy" --currency KES
@@ -195,6 +212,12 @@ uv run python -m app.cli create-pricing-rule \
   --application school-management --channel whatsapp --message-kind template \
   --billing-category utility --currency KES --price <configured-price>
 ```
+
+School Management's production target is billing-required. Enable it explicitly only
+after its billing accounts and pricing are ready; the migration intentionally leaves
+all applications unchanged. Application-policy mutation is an operator-only CLI
+capability and is not exposed to application API keys. Inspection commands never print
+API-key hashes or secrets.
 
 Related commands are `list-billing-accounts`, `show-billing-account`,
 `suspend-billing-account`, `activate-billing-account`, `show-balance`,

@@ -14,6 +14,10 @@ def test_admin_commands_are_registered() -> None:
     )
     assert {
         "create-template",
+        "list-applications",
+        "show-application",
+        "require-application-billing",
+        "allow-application-unbilled",
         "list-templates",
         "disable-template",
         "enable-template",

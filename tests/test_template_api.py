@@ -9,6 +9,7 @@ from app.api.dependencies import get_authenticated_application
 from app.api.routes.messages import get_messaging_service
 from app.db.session import get_db_session
 from app.services.messaging import (
+    BillingAccountRequiredError,
     IdempotencyConflictError,
     TemplateNotFoundError,
     TemplateParameterError,
@@ -80,11 +81,19 @@ async def test_template_api_success(app) -> None:
         (TemplateUnavailableError(), 409),
         (TemplateParameterError("missing parameters: term"), 422),
         (IdempotencyConflictError(), 409),
+        (BillingAccountRequiredError(), 422),
     ],
 )
 async def test_template_api_maps_domain_errors(app, error, status_code) -> None:
     response = await call(app, Service(error))
     assert response.status_code == status_code
+
+
+@pytest.mark.asyncio
+async def test_billing_required_error_has_stable_code(app) -> None:
+    response = await call(app, Service(BillingAccountRequiredError()))
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "billing_account_required"
 
 
 @pytest.mark.asyncio

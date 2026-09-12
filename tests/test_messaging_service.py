@@ -9,6 +9,7 @@ from app.schemas.messages import TemplateMessageRequest, TextMessageRequest
 from app.schemas.whatsapp import WhatsAppSendResult
 from app.services.billing import BillingQuote, InsufficientBalanceError
 from app.services.messaging import (
+    BillingAccountRequiredError,
     IdempotencyConflictError,
     MessagingService,
     TemplateNotFoundError,
@@ -166,6 +167,85 @@ async def test_exact_retry_returns_existing_without_provider_call() -> None:
 
 
 @pytest.mark.asyncio
+async def test_required_billing_rejects_new_text_before_row_or_provider() -> None:
+    provider = Provider()
+    repository = Repository()
+    billing = Billing()
+    with pytest.raises(BillingAccountRequiredError):
+        await MessagingService(provider, repository, billing_service=billing).send_text(
+            Session(),
+            SimpleNamespace(id=uuid4(), billing_required=True),
+            "billing-required-text-001",
+            request(),
+        )
+    assert repository.message is None
+    assert provider.calls == 0
+    assert billing.reservations == 0
+
+
+@pytest.mark.asyncio
+async def test_required_billing_rejects_new_template_before_lookup_row_or_provider() -> None:
+    provider = Provider()
+    repository = Repository()
+    billing = Billing()
+    with pytest.raises(BillingAccountRequiredError):
+        await MessagingService(
+            provider, repository, TemplateRepository(template()), billing_service=billing
+        ).send_template(
+            Session(),
+            SimpleNamespace(id=uuid4(), billing_required=True),
+            "billing-required-template-001",
+            template_request(),
+        )
+    assert repository.message is None
+    assert provider.calls == 0
+    assert billing.reservations == 0
+
+
+@pytest.mark.asyncio
+async def test_required_billing_preserves_exact_historical_unbilled_replay() -> None:
+    payload = request()
+    existing = SimpleNamespace(payload_hash=canonical_payload_hash(payload), status="uncertain")
+    provider = Provider()
+    result = await MessagingService(provider, Repository(existing)).send_text(
+        Session(),
+        SimpleNamespace(id=uuid4(), billing_required=True),
+        "historical-unbilled-001",
+        payload,
+    )
+    assert result is existing
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_non_required_application_still_allows_unbilled_send() -> None:
+    provider = Provider()
+    repository = Repository()
+    result = await MessagingService(provider, repository).send_text(
+        Session(),
+        SimpleNamespace(id=uuid4(), billing_required=False),
+        "legacy-unbilled-001",
+        request(),
+    )
+    assert result.status == "sent"
+    assert repository.message.billing_account_id is None
+
+
+@pytest.mark.asyncio
+async def test_required_application_with_account_uses_existing_billing_flow() -> None:
+    provider = Provider()
+    billing = Billing()
+    result = await MessagingService(provider, Repository(), billing_service=billing).send_text(
+        Session(),
+        SimpleNamespace(id=uuid4(), billing_required=True),
+        "required-billed-001",
+        request().model_copy(update={"billing_account": "school-001"}),
+    )
+    assert result.status == "sent"
+    assert (provider.calls, billing.reservations, billing.charges) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
 async def test_same_key_with_different_payload_conflicts() -> None:
     existing = SimpleNamespace(payload_hash=canonical_payload_hash(request("first")))
     with pytest.raises(IdempotencyConflictError):
@@ -180,8 +260,8 @@ async def test_same_key_with_different_payload_conflicts() -> None:
     [
         (WhatsAppClientResponseError("bad request", status_code=400), OutboundMessageStatus.FAILED),
         (
-            WhatsAppClientResponseError("server error", status_code=503),
-            OutboundMessageStatus.FAILED,
+            WhatsAppClientResponseError("server error", status_code=503, ambiguous_delivery=True),
+            OutboundMessageStatus.UNCERTAIN,
         ),
         (WhatsAppTimeoutError("timeout", ambiguous_delivery=True), OutboundMessageStatus.UNCERTAIN),
     ],

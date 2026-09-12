@@ -75,6 +75,43 @@ async def create_application(args: argparse.Namespace) -> None:
     print(f"Created application: {args.slug}")
 
 
+async def list_applications(args: argparse.Namespace) -> None:
+    async with async_session_factory() as session:
+        applications = list(
+            (
+                await session.scalars(
+                    select(MessagingApplication).order_by(MessagingApplication.slug)
+                )
+            ).all()
+        )
+    print("id\tslug\tname\tstatus\tbilling_required\tcreated_at")
+    for application in applications:
+        print(
+            f"{application.id}\t{application.slug}\t{application.name}\t"
+            f"{application.status}\t{application.billing_required}\t{application.created_at}"
+        )
+
+
+async def show_application(args: argparse.Namespace) -> None:
+    async with async_session_factory() as session:
+        application = await _application(session, args.application)
+        print(
+            f"id={application.id}\nslug={application.slug}\nname={application.name}\n"
+            f"description={application.description or '-'}\nstatus={application.status}\n"
+            f"billing_required={application.billing_required}\n"
+            f"created_at={application.created_at}\nupdated_at={application.updated_at}"
+        )
+
+
+async def set_application_billing_policy(args: argparse.Namespace) -> None:
+    required = args.command == "require-application-billing"
+    async with async_session_factory() as session, session.begin():
+        application = await _application(session, args.application)
+        application.billing_required = required
+    policy = "billing-required" if required else "unbilled traffic allowed"
+    print(f"Application {args.application} is now {policy}")
+
+
 async def create_api_key(args: argparse.Namespace) -> None:
     async with async_session_factory() as session, session.begin():
         application = await _application(session, args.application)
@@ -715,6 +752,15 @@ def parser() -> argparse.ArgumentParser:
     application.add_argument("--slug", required=True)
     application.add_argument("--description")
     application.set_defaults(handler=create_application)
+    application_list = commands.add_parser("list-applications")
+    application_list.set_defaults(handler=list_applications)
+    application_show = commands.add_parser("show-application")
+    application_show.add_argument("--application", required=True)
+    application_show.set_defaults(handler=show_application)
+    for name in ("require-application-billing", "allow-application-unbilled"):
+        billing_policy = commands.add_parser(name)
+        billing_policy.add_argument("--application", required=True)
+        billing_policy.set_defaults(handler=set_application_billing_policy)
 
     key = commands.add_parser("create-api-key")
     key.add_argument("--application", required=True)

@@ -24,6 +24,7 @@ from app.services.billing import (
     PricingRuleNotFoundError,
 )
 from app.services.messaging import (
+    BillingAccountRequiredError,
     IdempotencyConflictError,
     MessagingService,
     TemplateNotFoundError,
@@ -36,6 +37,14 @@ router = APIRouter(prefix="/api/v1/messages", tags=["messages"])
 
 
 def billing_http_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, BillingAccountRequiredError):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "code": "billing_account_required",
+                "message": "billing_account is required for this application.",
+            },
+        )
     if isinstance(exc, BillingAccountNotFoundError):
         return HTTPException(status_code=404, detail="Billing account not found")
     if isinstance(exc, BillingAccountSuspendedError):
@@ -115,6 +124,8 @@ async def send_text_message(
         raise HTTPException(
             status_code=409, detail="Idempotency key was used with a different payload"
         ) from exc
+    except BillingAccountRequiredError as exc:
+        raise billing_http_error(exc) from exc
     except (
         BillingAccountNotFoundError,
         BillingAccountSuspendedError,
@@ -152,6 +163,8 @@ async def send_template_message(
         raise HTTPException(
             status_code=409, detail="Idempotency key was used with a different payload"
         ) from exc
+    except BillingAccountRequiredError as exc:
+        raise billing_http_error(exc) from exc
     except (
         BillingAccountNotFoundError,
         BillingAccountSuspendedError,

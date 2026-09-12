@@ -121,12 +121,26 @@ class WhatsAppCloudAPIClient:
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     response = await client.post(self._messages_url, headers=headers, json=payload)
-        except httpx.TimeoutException as exc:
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API connection could not be established", ambiguous_delivery=False
+            ) from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
             raise WhatsAppTimeoutError(
                 "WhatsApp API request timed out", ambiguous_delivery=True
             ) from exc
+        except httpx.ConnectError as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API connection could not be established", ambiguous_delivery=False
+            ) from exc
+        except httpx.LocalProtocolError as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API request was rejected locally", ambiguous_delivery=False
+            ) from exc
         except httpx.RequestError as exc:
-            raise WhatsAppNetworkError("WhatsApp API network request failed") from exc
+            raise WhatsAppNetworkError(
+                "WhatsApp API network request outcome is unknown", ambiguous_delivery=True
+            ) from exc
 
         if not response.is_success:
             self._raise_response_error(response)
@@ -139,7 +153,11 @@ class WhatsAppCloudAPIClient:
             if 400 <= response.status_code < 500
             else WhatsAppServerResponseError
         )
-        raise error_class(status_code=response.status_code, **details)
+        raise error_class(
+            status_code=response.status_code,
+            ambiguous_delivery=response.status_code >= 500,
+            **details,
+        )
 
     def _safe_error_details(self, response: httpx.Response) -> dict[str, str | None]:
         error: dict[str, Any] = {}
@@ -181,6 +199,11 @@ class WhatsAppCloudAPIClient:
                 )
             if messages and isinstance(messages[0].get("id"), str):
                 meta_message_id = messages[0]["id"]
+
+        if not meta_message_id:
+            raise WhatsAppMalformedResponseError(
+                "WhatsApp API success response omitted message ID", ambiguous_delivery=True
+            )
 
         return WhatsAppSendResult(
             recipient=recipient,

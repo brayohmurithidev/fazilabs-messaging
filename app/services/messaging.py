@@ -22,6 +22,10 @@ class IdempotencyConflictError(Exception):
     pass
 
 
+class BillingAccountRequiredError(Exception):
+    pass
+
+
 class TemplateNotFoundError(Exception):
     pass
 
@@ -72,6 +76,8 @@ class MessagingService:
                 if existing.payload_hash != payload_hash:
                     raise IdempotencyConflictError
                 return existing
+            if getattr(application, "billing_required", False) and request.billing_account is None:
+                raise BillingAccountRequiredError
             if request.billing_account is not None:
                 quote = await self.billing_service.quote_and_lock(
                     session,
@@ -163,6 +169,8 @@ class MessagingService:
                 if existing.payload_hash != payload_hash:
                     raise IdempotencyConflictError
                 return existing
+            if getattr(application, "billing_required", False) and request.billing_account is None:
+                raise BillingAccountRequiredError
             template = await self.template_repository.get(
                 session, application.id, request.template, request.channel.value
             )
