@@ -47,6 +47,7 @@ class CurrencyMismatchError(Exception):
 class BillingQuote:
     account: BillingAccount
     pricing_rule: PricingRule
+    amount_minor: int = 0
 
 
 def normalize_currency(value: str) -> str:
@@ -67,25 +68,21 @@ def major_to_minor(value: str) -> int:
 
 
 class BillingService:
-    async def quote_and_lock(
+    async def resolve_account(
         self,
         session: AsyncSession,
         *,
         application_id: UUID,
         external_id: str,
-        channel: str,
-        message_kind: str,
-        billing_category: str | None,
-        at: datetime | None = None,
-    ) -> BillingQuote:
-        account = await session.scalar(
-            select(BillingAccount)
-            .where(
-                BillingAccount.application_id == application_id,
-                BillingAccount.external_id == external_id,
-            )
-            .with_for_update()
+        lock: bool = False,
+    ) -> BillingAccount:
+        statement = select(BillingAccount).where(
+            BillingAccount.application_id == application_id,
+            BillingAccount.external_id == external_id,
         )
+        if lock:
+            statement = statement.with_for_update()
+        account = await session.scalar(statement)
         if account is None:
             raise BillingAccountNotFoundError
         logger.info(
@@ -95,6 +92,26 @@ class BillingService:
         if account.status != "active":
             logger.info("billing_account_suspended", extra={"billing_account_id": str(account.id)})
             raise BillingAccountSuspendedError
+        return account
+
+    async def quote_and_lock(
+        self,
+        session: AsyncSession,
+        *,
+        application_id: UUID,
+        external_id: str,
+        channel: str,
+        message_kind: str,
+        billing_category: str | None,
+        units: int = 1,
+        at: datetime | None = None,
+    ) -> BillingQuote:
+        account = await self.resolve_account(
+            session,
+            application_id=application_id,
+            external_id=external_id,
+            lock=True,
+        )
         effective_at = at or datetime.now(UTC)
         rules = list(
             (
@@ -122,20 +139,21 @@ class BillingService:
         if len(rules) != 1:
             raise AmbiguousPricingRuleError
         rule = rules[0]
-        if account.balance_minor - account.reserved_minor < rule.customer_price_minor:
+        amount_minor = rule.customer_price_minor * units
+        if account.balance_minor - account.reserved_minor < amount_minor:
             logger.info("insufficient_balance", extra={"billing_account_id": str(account.id)})
             raise InsufficientBalanceError
-        return BillingQuote(account, rule)
+        return BillingQuote(account, rule, amount_minor)
 
     async def reserve(
         self, session: AsyncSession, quote: BillingQuote, outbound_message_id: UUID
     ) -> BillingReservation:
-        quote.account.reserved_minor += quote.pricing_rule.customer_price_minor
+        quote.account.reserved_minor += quote.amount_minor
         reservation = BillingReservation(
             billing_account_id=quote.account.id,
             outbound_message_id=outbound_message_id,
             pricing_rule_id=quote.pricing_rule.id,
-            amount_minor=quote.pricing_rule.customer_price_minor,
+            amount_minor=quote.amount_minor,
             currency=quote.pricing_rule.currency,
         )
         session.add(reservation)
@@ -190,9 +208,11 @@ class BillingService:
                 message_kind=message.message_kind,
                 billing_category=message.billing_category,
                 provider=message.provider,
+                billing_mode="customer",
                 pricing_rule_id=reservation.pricing_rule_id,
                 currency=reservation.currency,
-                provider_cost_minor=None,
+                provider_cost_minor=getattr(message, "provider_cost_minor", None),
+                sms_page_count=getattr(message, "sms_page_count", None),
                 customer_price_minor=reservation.amount_minor,
             )
         )
@@ -212,6 +232,37 @@ class BillingService:
             extra={"billing_account_id": str(account.id), "outbound_message_id": str(message.id)},
         )
         return True
+
+    async def record_platform_usage(
+        self, session: AsyncSession, message: OutboundMessage
+    ) -> MessageUsage:
+        existing = await session.scalar(
+            select(MessageUsage).where(MessageUsage.outbound_message_id == message.id)
+        )
+        if existing is not None:
+            return existing
+        usage = MessageUsage(
+            application_id=message.application_id,
+            billing_account_id=message.billing_account_id,
+            outbound_message_id=message.id,
+            channel=message.channel,
+            message_kind=message.message_kind,
+            billing_category=message.billing_category,
+            provider=message.provider,
+            billing_mode="platform",
+            pricing_rule_id=None,
+            currency=None,
+            provider_cost_minor=getattr(message, "provider_cost_minor", None),
+            sms_page_count=getattr(message, "sms_page_count", None),
+            customer_price_minor=0,
+            billing_status="platform_funded",
+        )
+        session.add(usage)
+        logger.info(
+            "platform_funded_usage_recorded",
+            extra={"outbound_message_id": str(message.id)},
+        )
+        return usage
 
     async def release(self, session: AsyncSession, outbound_message_id: UUID) -> None:
         reservation = await session.scalar(

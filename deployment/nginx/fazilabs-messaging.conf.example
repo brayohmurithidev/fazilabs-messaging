@@ -1,0 +1,101 @@
+# Production routing example. Both public hosts proxy to one private Uvicorn process.
+# Replace certificate paths through the selected certificate-management process.
+
+limit_req_zone $binary_remote_addr zone=messaging_api:10m rate=30r/s;
+limit_req_zone $binary_remote_addr zone=messaging_webhooks:10m rate=30r/s;
+
+upstream fazilabs_messaging {
+    server 127.0.0.1:8000;
+    keepalive 32;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+    return 444;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name messaging.fazicore.app api.messaging.fazicore.app;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name messaging.fazicore.app;
+
+    ssl_certificate /etc/nginx/tls/messaging.fazicore.app/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/messaging.fazicore.app/privkey.pem;
+    client_max_body_size 1m;
+
+    location = /docs {
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location = /redoc {
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location = /openapi.json {
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    # Reserve this host for a future operator surface. Do not proxy consumer API routes here.
+    location / {
+        return 404;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name api.messaging.fazicore.app;
+
+    ssl_certificate /etc/nginx/tls/api.messaging.fazicore.app/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/api.messaging.fazicore.app/privkey.pem;
+    client_max_body_size 1m;
+
+    location = /health {
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location = /ready {
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location /api/v1/ {
+        limit_req zone=messaging_api burst=60 nodelay;
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location = /webhooks/whatsapp {
+        limit_req zone=messaging_webhooks burst=100 nodelay;
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location = /webhooks/advanta {
+        limit_req zone=messaging_webhooks burst=100 nodelay;
+
+        # Enable only after Advanta confirms stable callback source ranges:
+        # allow <ADVANTA_CALLBACK_CIDR>;
+        # deny all;
+
+        proxy_pass http://fazilabs_messaging;
+        include /etc/nginx/snippets/fazilabs-messaging-proxy.conf;
+    }
+
+    location / {
+        return 404;
+    }
+}

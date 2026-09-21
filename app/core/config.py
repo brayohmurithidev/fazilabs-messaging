@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str | None = None
     whatsapp_api_version: str | None = None
     public_webhook_base_url: str | None = None
+    advanta_base_url: str | None = None
+    advanta_api_key: SecretStr | None = None
+    advanta_partner_id: SecretStr | None = None
+    advanta_sender_id: str = "FAZILABS"
+    advanta_provider_cost_per_page_minor: int | None = Field(default=None, ge=0)
     billing_uncertain_reconcile_after_minutes: int = Field(default=1440, ge=1)
 
     @model_validator(mode="after")

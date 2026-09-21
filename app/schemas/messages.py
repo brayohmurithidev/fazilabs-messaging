@@ -10,6 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 class Channel(StrEnum):
     WHATSAPP = "whatsapp"
+    SMS = "sms"
+
+
+class MessageStatus(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    DELIVERED = "delivered"
+    READ = "read"
+    FAILED = "failed"
+    UNCERTAIN = "uncertain"
 
 
 class TextMessageRequest(BaseModel):
@@ -17,18 +27,34 @@ class TextMessageRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "channel": "whatsapp",
-                "to": "254700000001",
+                "to": "254700000000",
                 "text": "Your requested information is ready.",
-                "metadata": {"source_type": "student", "source_id": "student-123"},
+                "billing_account": "school-example-001",
+                "metadata": {"source_type": "request", "source_id": "request-example-001"},
             }
         }
     )
 
-    channel: Channel
-    to: str = Field(min_length=8, max_length=20)
-    billing_account: str | None = Field(default=None, min_length=1, max_length=160)
-    text: str = Field(min_length=1, max_length=4096)
-    metadata: dict[str, Any] | None = None
+    channel: Channel = Field(description="Must be `whatsapp`; free-form SMS is not supported.")
+    to: str = Field(
+        min_length=8,
+        max_length=20,
+        description="Recipient in international E.164 form; punctuation is normalized away.",
+    )
+    billing_account: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description=(
+            "Application-scoped customer account identity. Required when application billing "
+            "policy requires prepaid billing."
+        ),
+    )
+    text: str = Field(min_length=1, max_length=4096, description="Nonblank WhatsApp text body.")
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional opaque source metadata, limited to 8 KiB.",
+    )
 
     @field_validator("to")
     @classmethod
@@ -39,6 +65,13 @@ class TextMessageRequest(BaseModel):
         if not re.fullmatch(r"[1-9]\d{7,14}", normalized):
             raise ValueError("recipient must be an international E.164 number")
         return normalized
+
+    @field_validator("channel")
+    @classmethod
+    def whatsapp_only(cls, value: Channel) -> Channel:
+        if value is not Channel.WHATSAPP:
+            raise ValueError("text messages currently support WhatsApp only")
+        return value
 
     @field_validator("text")
     @classmethod
@@ -65,26 +98,66 @@ class TemplateMessageRequest(BaseModel):
                 "to": "254700000001",
                 "template": "student_results_ready",
                 "parameters": {
-                    "parent_name": "Jane",
-                    "student_name": "Brian",
+                    "parent_name": "Amina",
+                    "student_name": "Baraka",
                     "term": "Term 2",
+                    "results_path": "example-access-token",
                 },
-                "metadata": {"source_type": "student_result", "source_id": "result-123"},
+                "billing_account": "school-example-001",
+                "metadata": {
+                    "source_type": "student_result",
+                    "source_id": "result-example-001",
+                },
             }
         }
     )
 
-    channel: Channel
-    to: str = Field(min_length=8, max_length=20)
-    billing_account: str | None = Field(default=None, min_length=1, max_length=160)
-    template: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-    parameters: dict[str, str] = Field(default_factory=dict, max_length=20)
-    metadata: dict[str, Any] | None = None
+    channel: Channel = Field(description="Channel mapping to resolve: `whatsapp` or `sms`.")
+    to: str = Field(
+        min_length=8,
+        max_length=20,
+        description=(
+            "Recipient. SMS accepts supported Kenyan 07/01, 2547/2541, or +2547/+2541 forms "
+            "and stores canonical 254… form; WhatsApp expects international E.164 form."
+        ),
+    )
+    billing_account: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=160,
+        description=(
+            "Application-scoped attribution/funding account. Customer-funded mappings may require "
+            "it; a supplied account never changes a platform-funded mapping into customer-funded."
+        ),
+    )
+    template: str = Field(
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9]+(?:_[a-z0-9]+)*$",
+        description="Semantic template key; the channel-specific provider mapping is server-side.",
+    )
+    parameters: dict[str, str] = Field(
+        default_factory=dict,
+        max_length=20,
+        description=(
+            "Named semantic values required by this channel mapping. Missing and extra names are "
+            "rejected; raw provider component payloads are not accepted."
+        ),
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional opaque source metadata, limited to 8 KiB.",
+    )
 
-    @field_validator("to")
-    @classmethod
-    def normalize_phone(cls, value: str) -> str:
-        return TextMessageRequest.normalize_phone(value)
+    @model_validator(mode="after")
+    def normalize_recipient(self) -> "TemplateMessageRequest":
+        if self.channel is Channel.SMS:
+            from app.services.sms import normalize_kenyan_sms_recipient
+
+            self.to = normalize_kenyan_sms_recipient(self.to)
+        else:
+            self.to = TextMessageRequest.normalize_phone(self.to)
+        return self
 
     @field_validator("parameters")
     @classmethod
@@ -112,7 +185,12 @@ class MessageResponse(BaseModel):
     id: UUID
     application: str
     channel: str
-    status: str
+    status: MessageStatus = Field(
+        description=(
+            "Lifecycle state. `uncertain` means provider acceptance could not safely be proved or "
+            "rejected; Messaging does not automatically resubmit it."
+        )
+    )
     recipient: str
     message_kind: str
     template: str | None
@@ -125,6 +203,13 @@ class MessageResponse(BaseModel):
     delivered_at: datetime | None
     read_at: datetime | None
     failed_at: datetime | None
+    sms_character_count: int | None = Field(
+        default=None, description="Rendered SMS character count; null for WhatsApp."
+    )
+    sms_page_count: int | None = Field(
+        default=None,
+        description="Rendered SMS pages at 160 characters per page; null for WhatsApp.",
+    )
 
 
 class MessageListResponse(BaseModel):
@@ -137,8 +222,15 @@ class MessageListResponse(BaseModel):
 class TemplateCapability(BaseModel):
     key: str
     channel: str
-    language: str
+    language: str | None
     parameters: list[str]
+    billing_mode: str = Field(
+        description="`customer` uses customer-wallet funding; `platform` is funded by Fazilabs."
+    )
+    provider_route: str | None = Field(
+        default=None,
+        description="SMS route (`standard` or `transactional`); null for WhatsApp.",
+    )
 
 
 class TemplateCapabilityList(BaseModel):

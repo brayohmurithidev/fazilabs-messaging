@@ -1,451 +1,509 @@
-# Fazilabs Messaging Platform
+# Fazilabs Messaging
 
-Fazilabs Messaging Platform is a reusable, application-facing service for customer communications. Fazilabs systems authenticate independently, submit domain-neutral message requests, and receive platform-owned message IDs. WhatsApp Cloud API is the only implemented channel; SMS and email can be added behind the same messaging boundary later.
+Fazilabs Messaging is centralized messaging infrastructure for Fazilabs products. Consumer
+applications submit semantic messages through one authenticated API; Messaging owns provider
+integration, delivery state, and billing.
+
+The service is built with FastAPI, SQLAlchemy/asyncpg, PostgreSQL, Alembic, HTTPX, Pydantic, and
+Python 3.12 or later.
+
+## Responsibility boundary
+
+The consuming application owns:
+
+- the business event and decision to notify;
+- recipient selection and domain data;
+- semantic template selection and named parameters;
+- links or access tokens placed in template parameters;
+- safe source metadata; and
+- a stable idempotency identity for each logical send.
+
+Fazilabs Messaging owns:
+
+- Meta and Advanta integration and credentials;
+- sender identities and channel/provider mappings;
+- approved provider templates and SMS rendering;
+- delivery webhooks and status;
+- pricing, wallet reservations, charging, usage, and reconciliation.
+
+**New template = configuration/data. New messaging capability = code.** Consumers never receive
+Meta access tokens, WhatsApp Phone Number IDs, Advanta credentials, provider-template internals,
+wallet internals, or reconciliation internals.
+
+## Supported channels
+
+| Channel | Provider | Public sends | Provider-specific behavior |
+| --- | --- | --- | --- |
+| WhatsApp | Meta WhatsApp Cloud API | Free-form text and approved semantic templates | BODY parameters, dynamic URL buttons, inbound events, and sent/delivered/read callbacks |
+| SMS | Advanta | Semantic templates only | Kenyan number normalization, standard/transactional route, page analysis, DLR callbacks |
+
+An SMS route and template billing mode are independent mapping properties. A transactional SMS can
+be customer-funded, and a standard SMS can be platform-funded.
+
+## API overview
+
+| Method | Path | Authentication | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/` | Public | Service metadata |
+| `GET` | `/health` | Public | Process liveness only |
+| `GET` | `/ready` | Public | Application and PostgreSQL readiness |
+| `POST` | `/api/v1/messages/text` | Application API key | Send WhatsApp text |
+| `POST` | `/api/v1/messages/template` | Application API key | Send a WhatsApp or SMS template |
+| `GET` | `/api/v1/messages/{message_id}` | Application API key | Get an application-owned message |
+| `GET` | `/api/v1/messages` | Application API key | List application-owned messages |
+| `GET` | `/api/v1/templates` | Application API key | List active semantic template capabilities |
+| `GET` | `/api/v1/billing-accounts/{external_id}/balance` | Application API key | Read wallet balance and reservations |
+| `GET` | `/api/v1/billing-accounts/{external_id}/usage` | Application API key | Read accepted-message usage |
+| `GET`, `POST` | `/webhooks/whatsapp` | Provider-facing | Meta verification and events |
+| `POST` | `/webhooks/advanta` | Provider-facing | Advanta delivery reports |
+
+Application and API-key administration, wallet mutation, pricing, template mutation, and financial
+reconciliation are CLI-only operator capabilities.
+
+## Authentication
+
+Protected routes require:
 
 ```text
-School Management ─┐
-Invoicing ─────────┼─> /api/v1/messages ─> MessagingService ─> WhatsApp/Meta
-Other applications ┘
+Authorization: Bearer <application-api-key>
 ```
 
-The service uses FastAPI, async SQLAlchemy 2, PostgreSQL/asyncpg, Alembic, HTTPX, Pydantic v2, uv, pytest, and Ruff. Existing signed Meta webhook verification, inbound persistence, inbound idempotency, and outbound Cloud API transport are preserved.
-
-## Setup
-
-Create a PostgreSQL database, copy `.env.example` to `.env`, and set:
-
-```env
-APP_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/whatsapp_agent
-APP_WHATSAPP_VERIFY_TOKEN=...
-APP_WHATSAPP_APP_SECRET=...
-APP_WHATSAPP_ACCESS_TOKEN=...
-APP_WHATSAPP_PHONE_NUMBER_ID=...
-APP_WHATSAPP_API_VERSION=v26.0
-APP_PUBLIC_WEBHOOK_BASE_URL=https://current-public-host.example
-```
-
-Meta credentials belong only to this platform. Calling-application keys are database records and must never be placed in global environment configuration.
+An operator creates an application key with:
 
 ```bash
+uv run python -m app.cli create-api-key \
+  --application local-demo \
+  --name local-development
+```
+
+Messaging generates keys in the `fzmsg_<prefix>_<secret>` form. The raw value is printed only at
+creation, belongs in the consuming application's secret environment, and must never be committed or
+logged. Messaging stores only its secure hash. Use `list-api-keys` and `revoke-api-key` for rotation.
+
+Billing accounts, messages, templates, and API keys are always scoped to the authenticated
+application.
+
+## Idempotency
+
+Every send requires a caller-generated, non-secret `Idempotency-Key` header. It identifies one
+logical business operation; Messaging does not generate it.
+
+- The same key and identical semantic request returns the original message.
+- The replay makes no second provider call, reservation, debit, or usage record.
+- The same key with any changed request field returns HTTP `409`.
+- After an uncertain HTTP outcome, retry with the original key and exact request.
+- Do not generate a new random key on each transport retry.
+
+Examples of caller-defined keys include `demo-results-001`,
+`results:<publication_id>:<recipient_id>`, and `invoice:<invoice_id>:<recipient_id>`. They are not
+secrets.
+
+## Sending messages
+
+Set local shell variables without committing their values:
+
+```bash
+export MESSAGING_BASE_URL=http://127.0.0.1:8000
+export MESSAGING_API_KEY=<MESSAGING_API_KEY>
+```
+
+### WhatsApp text
+
+`POST /api/v1/messages/text` supports WhatsApp only:
+
+```bash
+curl --fail-with-body "$MESSAGING_BASE_URL/api/v1/messages/text" \
+  -H "Authorization: Bearer $MESSAGING_API_KEY" \
+  -H "Idempotency-Key: demo-text-001" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "channel": "whatsapp",
+    "to": "254700000000",
+    "billing_account": "school-example-001",
+    "text": "Your requested information is ready.",
+    "metadata": {"source_type": "request", "source_id": "request-example-001"}
+  }'
+```
+
+### WhatsApp template
+
+```bash
+curl --fail-with-body "$MESSAGING_BASE_URL/api/v1/messages/template" \
+  -H "Authorization: Bearer $MESSAGING_API_KEY" \
+  -H "Idempotency-Key: demo-results-whatsapp-001" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "channel": "whatsapp",
+    "to": "254700000000",
+    "template": "student_results_ready",
+    "parameters": {
+      "parent_name": "Amina",
+      "student_name": "Baraka",
+      "term": "Term 2",
+      "results_path": "example-access-token"
+    },
+    "billing_account": "school-example-001",
+    "metadata": {
+      "source_type": "student_result",
+      "source_id": "result-example-001"
+    }
+  }'
+```
+
+The fixed portion of a dynamic Meta URL is configured in the approved provider template. The
+consumer supplies only the named dynamic value; it never constructs Meta component syntax.
+
+### SMS template
+
+```bash
+curl --fail-with-body "$MESSAGING_BASE_URL/api/v1/messages/template" \
+  -H "Authorization: Bearer $MESSAGING_API_KEY" \
+  -H "Idempotency-Key: demo-results-sms-001" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "channel": "sms",
+    "to": "254700000000",
+    "template": "student_results_ready",
+    "parameters": {
+      "parent_name": "Amina",
+      "student_name": "Baraka",
+      "term": "Term 2",
+      "results_url": "https://example.com/results/example-access-token"
+    },
+    "billing_account": "school-example-001",
+    "metadata": {
+      "source_type": "student_result",
+      "source_id": "result-example-001"
+    }
+  }'
+```
+
+SMS recipients accept supported Kenyan `07…`, `01…`, `2547…`, `2541…`, `+2547…`, and `+2541…`
+forms and are stored/sent in canonical `254…` form. SMS mappings render named values server-side;
+missing or extra parameters fail before provider submission.
+
+The current Fazilabs Advanta account rules are 160 characters per page, at most 6 pages/960
+characters, and no emoji. Spaces and punctuation count. Empty, emoji-containing, and oversized
+messages are rejected before wallet reservation or provider submission. These are confirmed account
+commercial/provider rules, not universal assumptions about every SMS provider.
+
+Successful SMS responses expose `sms_character_count` and `sms_page_count`; these fields are null
+for WhatsApp. The Advanta `standard` or `transactional` route is template configuration, never a
+request field. The server-owned sender ID cannot be overridden by consumers.
+
+## Templates
+
+A semantic key describes intent, while each application can have a different mapping for each
+channel. For example, `student_results_ready/whatsapp` can use three BODY values and a dynamic URL
+button named `results_path`, while `student_results_ready/sms` can render a text body using
+`results_url`. Consumers should query `GET /api/v1/templates` and use the parameter names returned
+for the chosen channel.
+
+Example WhatsApp registration:
+
+```bash
+uv run python -m app.cli create-template \
+  --application local-demo \
+  --key student_results_ready \
+  --channel whatsapp \
+  --provider meta \
+  --provider-template-name student_results_ready \
+  --language en \
+  --parameter-schema '{"body":["parent_name","student_name","term"],"buttons":[{"index":0,"type":"url","parameter":"results_path"}]}' \
+  --billing-category utility \
+  --billing-mode customer
+```
+
+Example SMS registration:
+
+```bash
+uv run python -m app.cli create-template \
+  --application local-demo \
+  --key student_results_ready \
+  --channel sms \
+  --provider advanta \
+  --sms-route standard \
+  --sms-body 'Hi {{parent_name}}, {{student_name}} {{term}} results: {{results_url}}' \
+  --parameter-schema '{"body":["parent_name","student_name","term","results_url"]}' \
+  --billing-category utility \
+  --billing-mode customer
+```
+
+Use `update-template` to change mapping configuration in place and `enable-template` or
+`disable-template` for availability. Provider template names, language, SMS bodies, and button
+indices are intentionally absent from send requests.
+
+## Billing
+
+Messaging uses application-scoped billing accounts, prepaid wallets, effective-dated pricing rules,
+reservations, immutable usage, and append-only wallet transactions.
+
+- `billing_mode=customer`: the customer's wallet funds the message. When billing is required, the
+  caller supplies `billing_account`; Messaging resolves the price and reserves the full expected
+  charge before the provider call. SMS pricing is multiplied by rendered page count.
+- `billing_mode=platform`: Fazilabs funds the message. No customer wallet is reserved or debited,
+  but accepted usage and known provider cost remain tracked. An optional account is attribution
+  only.
+
+`MessagingApplication.billing_required` and template `billing_mode` have distinct roles. The
+application policy prevents customer-funded traffic from omitting a prepaid account while preserving
+legacy unbilled behavior only for applications explicitly configured to allow it. A platform-funded
+template can send without a customer account even when application billing is required. Callers
+cannot choose or override template billing mode.
+
+Provider acceptance is the accounting point. On acceptance, the reservation becomes a debit and one
+usage record is created. A confirmed submission rejection releases the reservation with no debit or
+usage. An ambiguous submission retains the reservation and records the message as `uncertain` for
+operator reconciliation. Later handset-delivery failure does not automatically refund an accepted
+message.
+
+Provider cost and customer selling price are independent. Advanta provider cost is calculated per
+accepted SMS page only when configured; unknown cost remains null rather than being invented as zero.
+Example prices in this README are test-only, never production/commercial pricing.
+
+## Message lifecycle
+
+Public message states are:
+
+- `pending`: persisted before provider submission;
+- `sent`: the provider accepted the submission;
+- `delivered`: a provider callback reported terminal delivery;
+- `read`: a WhatsApp callback reported that the recipient read it;
+- `failed`: submission was definitively rejected, or a later delivery callback reported failure;
+- `uncertain`: provider acceptance could not safely be determined.
+
+```text
+pending ── accepted ──> sent ── callback ──> delivered ── WhatsApp callback ──> read
+   │
+   ├── confirmed rejection ──> failed (customer reservation released)
+   └── ambiguous outcome ────> uncertain (reservation retained; operator reconciliation)
+```
+
+An uncertain message is never blindly submitted again. Exact idempotent replay returns its existing
+record. Operators investigate provider evidence before recording an accepted, rejected, or unknown
+reconciliation outcome.
+
+## Webhooks
+
+Meta calls `GET /webhooks/whatsapp` to verify a subscription and
+`POST /webhooks/whatsapp` for inbound messages and status updates. POST bodies require a valid
+`X-Hub-Signature-256` using the configured Meta app secret. Public HTTPS and a current callback URL
+are required for real callbacks.
+
+Advanta calls `POST /webhooks/advanta` with delivery reports. Known message IDs update lifecycle
+state idempotently; unknown IDs and states are safely acknowledged without corrupting data. The
+current Advanta information supplies no trustworthy callback signature mechanism. Do not invent one:
+restrict ingress by reverse proxy/network allowlisting where operationally possible, monitor the
+endpoint, and add provider-supported verification when available.
+
+Without reachable provider callbacks, a provider may have accepted or delivered a message while its
+local lifecycle remains at an earlier state.
+
+## Local development
+
+Prerequisites:
+
+- Python 3.12 or later;
+- [`uv`](https://docs.astral.sh/uv/);
+- PostgreSQL reachable through an asyncpg URL.
+
+Redis, a queue worker, and persistent filesystem storage are not used by the current application.
+The repository does not provide Docker or Docker Compose files; start PostgreSQL using your local
+development tooling.
+
+```bash
+cp .env.example .env
 uv sync
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-OpenAPI is available at `/docs` and `/openapi.json`.
+Replace every placeholder in `.env`; never commit `.env`. `APP_PUBLIC_WEBHOOK_BASE_URL` may remain
+empty for mock-only development. For real provider callbacks, expose the local API through a trusted
+HTTPS tunnel and update provider callback configuration to the current public URL.
 
-## Bootstrap an application
-
-There is intentionally no public credential-creation endpoint. Run the administrative CLI:
-
-```bash
-uv run python -m app.cli create-application \
-  --name "School Management System" \
-  --slug school-management
-
-uv run python -m app.cli create-api-key \
-  --application school-management \
-  --name development
-```
-
-The second command prints a `fzmsg_...` key once with the warning `Store this key now. It cannot be retrieved again.` Only its prefix and a salted scrypt hash are stored. Revoked keys fail immediately; disabled applications receive HTTP 403. API requests use `Authorization: Bearer <messaging-api-key>`.
-
-## Send a text message
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/v1/messages/text \
-  -H 'Authorization: Bearer <messaging-api-key>' \
-  -H 'Idempotency-Key: school:42:student:812:results:2026-term2' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "channel": "whatsapp",
-    "to": "254700000001",
-    "text": "Your requested information is ready.",
-    "metadata": {
-      "source_type": "student",
-      "source_id": "student-812",
-      "school_id": "school-42"
-    }
-  }'
-```
-
-Only WhatsApp is accepted. Recipients are normalized to international digits, text is limited to 4,096 characters, metadata to 8 KiB, and idempotency keys to a constrained 8–200 character format. Production business-initiated WhatsApp conversations may require an approved Meta template; free-form text is intended for controlled testing and valid customer-service windows.
-
-`Idempotency-Key` is unique per application in PostgreSQL. An identical retry returns the existing message and never calls Meta again. Reusing a key for a different canonical payload returns HTTP 409. The insert uses `ON CONFLICT`, so concurrency is protected by the database rather than an in-memory check.
-
-Responses contain the platform UUID, application slug, normalized recipient, lifecycle status, and provider message ID. They never include credentials or raw provider responses.
-
-## Query messages
-
-```text
-GET /api/v1/messages/{message_id}
-GET /api/v1/messages?status=sent&channel=whatsapp&source_type=student&limit=50&offset=0
-```
-
-List filters include status, channel, source type/id, `created_from`, and `created_to`. An authenticated application can only read its own rows; cross-application records appear not found and never appear in lists.
-
-## WhatsApp templates
-
-Business-initiated WhatsApp communication generally requires a template approved by Meta. Template lifecycle is deliberately split:
-
-```text
-Create and obtain approval in Meta
-→ map it to an application-owned internal key in Fazilabs Messaging
-→ calling application sends using only the internal key
-```
-
-Meta owns creation, approval, rejection, category decisions, and provider names. This platform stores mappings, validates named parameters, constructs Cloud API payloads, and sends approved templates. It never creates or modifies templates in Meta.
-
-Mappings are application-scoped, allowing different provider wording for the same internal key in different products. Create one after Meta approval:
-
-```bash
-uv run python -m app.cli create-template \
-  --application school-management \
-  --key student_results_ready \
-  --channel whatsapp \
-  --provider meta \
-  --provider-template-name fazi_student_results_ready_v1 \
-  --language en_US \
-  --billing-category utility \
-  --parameter-schema '{"body":["parent_name","student_name","term","results_url"]}'
-```
-
-Only ordered BODY text parameters are supported. Calling applications provide named values; the platform converts them into Meta's positional order. Missing and extra parameters are rejected with HTTP 422. Non-empty header or button schemas are rejected because those component types are not yet implemented.
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/v1/messages/template \
-  -H 'Authorization: Bearer <messaging-api-key>' \
-  -H 'Idempotency-Key: results:student-812:2026-term2' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "channel": "whatsapp",
-    "to": "254700000001",
-    "template": "student_results_ready",
-    "parameters": {
-      "parent_name": "Jane",
-      "student_name": "Brian",
-      "term": "Term 2",
-      "results_url": "https://school.example/results/result-001"
-    },
-    "metadata": {
-      "source_type": "student_result",
-      "source_id": "result-001"
-    }
-  }'
-```
-
-Each outbound row snapshots the internal key, parameter values, provider template name, and language used. Later mapping changes therefore do not erase what was actually requested and sent. Exact retries use the existing application-scoped PostgreSQL idempotency constraint and never call Meta twice.
-
-## Multi-tenant metering and prepaid billing
-
-`MessagingApplication` identifies an integrating product and owns its API keys.
-`BillingAccount` identifies one customer of that product. For example,
-`school-management` is one application while School A, School B, and School C are
-three application-scoped billing accounts. The stable `(application, external_id)`
-pair prevents one application from resolving another application's customer.
-
-Calling applications provide `billing_account` as the tenant's stable external ID.
-They do not calculate prices, mutate balances, know Meta pricing or credentials, or
-select provider template names. Each `MessagingApplication` has an operator-controlled
-`billing_required` policy. It defaults to false so existing and legacy/internal
-applications may continue explicitly unbilled traffic. When true, a new text or
-template request that omits `billing_account` returns HTTP 422 with code
-`billing_account_required`, before any outbound row, reservation, or provider call.
-Historical outbound rows are not assigned synthetic accounts.
-
-Exact idempotent replay is resolved before this policy check. Thus an exact replay of
-a historical unbilled row still returns that row—even if the application later becomes
-billing-required—and never submits it again. A changed payload remains a conflict.
-
-Money is stored as integer minor units. `KES 100.00` is `10000` minor units. KES is
-the only enabled currency in this phase. `wallet_transactions` is the immutable source
-of truth: amounts are positive and the transaction type determines credit or debit.
-Corrections require compensating entries. Cached `balance_minor` and `reserved_minor`
-are maintained transactionally but do not replace the ledger.
-
-Pricing is application-scoped and configurable by channel, message kind, explicit
-template billing category, currency, price, status, and effective period. Active
-periods for the same selector cannot overlap. Text requires an explicit text rule and
-is never implicitly free. No production selling price or Meta cost is seeded.
-
-The prepaid lifecycle is:
-
-```text
-lock BillingAccount
-→ resolve one effective PricingRule
-→ verify balance_minor - reserved_minor
-→ reserve funds and outbound idempotency row atomically
-→ call Meta after commit
-→ on a valid provider message ID, atomically mark sent + record usage + debit wallet
-```
-
-The account-row lock serializes reservations, so active reservations and charges
-cannot exceed prepaid funds. Confirmed provider rejection releases the reservation
-without charging. A valid HTTP 4xx is confirmed rejection. Read/write timeouts or
-failures, connection resets, remote protocol failures, HTTP 5xx, and ID-less/malformed
-2xx responses are `uncertain` and retain the reservation because acceptance cannot be
-disproved. A connection failure, connect timeout, local connection-pool timeout, or
-local protocol rejection is failed because submission did not reach Meta. Delivery/read
-updates and webhook replays do not charge again. There is no automatic refund for later
-delivery failure.
-
-Insufficient funds return HTTP 402 with `insufficient_messaging_balance` before Meta
-is called. A suspended account returns HTTP 403 without disabling other tenants.
-
-Administrative mutations remain local CLI operations:
-
-```bash
-uv run python -m app.cli list-applications
-uv run python -m app.cli show-application --application school-management
-uv run python -m app.cli require-application-billing --application school-management
-uv run python -m app.cli allow-application-unbilled --application school-management
-
-uv run python -m app.cli create-billing-account \
-  --application school-management --external-id <school-uuid> \
-  --name "Example Academy" --currency KES
-
-uv run python -m app.cli credit-billing-account \
-  --application school-management --external-id <school-uuid> \
-  --amount 5000.00 --currency KES --reference manual-topup-001
-
-uv run python -m app.cli create-pricing-rule \
-  --application school-management --channel whatsapp --message-kind template \
-  --billing-category utility --currency KES --price <configured-price>
-```
-
-School Management's production target is billing-required. Enable it explicitly only
-after its billing accounts and pricing are ready; the migration intentionally leaves
-all applications unchanged. Application-policy mutation is an operator-only CLI
-capability and is not exposed to application API keys. Inspection commands never print
-API-key hashes or secrets.
-
-Related commands are `list-billing-accounts`, `show-billing-account`,
-`suspend-billing-account`, `activate-billing-account`, `show-balance`,
-`list-wallet-transactions`, `list-pricing-rules`, `disable-pricing-rule`, and
-`monthly-usage-summary --period YYYY-MM`. Top-up references are unique per account.
-
-Authenticated applications have read-only access to:
-
-```text
-GET /api/v1/billing-accounts/{external_id}/balance
-GET /api/v1/billing-accounts/{external_id}/usage?from=...&to=...&channel=whatsapp&billing_category=utility&limit=50&offset=0
-```
-
-Usage snapshots the customer price and pricing rule at provider acceptance. Provider
-cost is a separate nullable field and may be reconciled later. The billing account is
-part of the canonical idempotency payload: exact retries do not reserve, debit, meter,
-or call Meta twice; changing it under the same key returns HTTP 409.
-
-A School Management client therefore needs only the platform URL, application key,
-school ID, recipient, internal template key, parameters, and idempotency key:
-
-```python
-await messaging.send_template(
-    billing_account=str(school.id),
-    template="student_results_ready",
-    to=parent.phone,
-    parameters={
-        "parent_name": parent.name,
-        "student_name": student.name,
-        "term": term.name,
-        "results_url": secure_url,
-    },
-    idempotency_key=f"results:{publication.id}:{parent.id}",
-    metadata={"source_type": "student_result", "source_id": str(publication.id)},
-)
-```
-
-Current limitations: no payment gateway, automated top-up, postpaid invoices,
-VAT/tax engine, automated provider-cost reconciliation, dashboard, automatic
-uncertain-reservation resolution, SMS, or email.
-
-Active capabilities are available to the authenticated application at `GET /api/v1/templates`; provider names are omitted from that public response.
-
-Template administration:
-
-```bash
-uv run python -m app.cli list-templates --application school-management
-uv run python -m app.cli disable-template --application school-management \
-  --key student_results_ready
-uv run python -m app.cli enable-template --application school-management \
-  --key student_results_ready
-```
-
-Suggested internal School Management keys are `student_results_ready`, `fee_payment_reminder`, `attendance_alert`, and `school_announcement`. Suggested invoicing keys are `invoice_created`, `payment_reminder`, and `payment_received`. These are recommendations only; no provider templates are created automatically.
-
-## API-key lifecycle and safe rotation
-
-```bash
-uv run python -m app.cli list-api-keys --application school-management
-uv run python -m app.cli create-api-key \
-  --application school-management --name local-development-2
-uv run python -m app.cli revoke-api-key \
-  --application school-management --key <key-uuid-or-prefix>
-```
-
-Listings contain UUID, non-secret prefix, name, status, and timestamps—never raw keys or hashes. Revoking an already-revoked key is safe. Rotate without downtime by creating a replacement, updating the calling application, verifying it works, and only then revoking the old UUID or prefix. Creating a replacement never automatically revokes a working key.
-
-## Local webhook readiness
-
-Outbound Cloud API calls can succeed while inbound and delivery/read callbacks fail to reach a developer laptop. For complete local testing, run both:
-
-```bash
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-ngrok http 8000
-```
-
-Set `APP_PUBLIC_WEBHOOK_BASE_URL` to the current externally reachable HTTPS origin and configure Meta's callback as:
-
-```text
-https://CURRENT_PUBLIC_HOST/webhooks/whatsapp
-```
-
-An ngrok hostname may change between sessions. It is only a development option; production should use its permanent public HTTPS endpoint. Check local prerequisites without sending a message or changing Meta:
+Check the operator plane without making a provider send:
 
 ```bash
 uv run python -m app.cli doctor
-uv run python -m app.cli doctor --check-reachability
-```
-
-Reachability is distinct from service health, so `/health` remains backward compatible even when a local tunnel is unavailable.
-
-## Webhook and lifecycle
-
-Meta uses `GET/POST /webhooks/whatsapp`. Verification uses the configured verify token, and POST bodies require a valid `X-Hub-Signature-256` HMAC before parsing. Inbound messages are persisted idempotently and are never auto-replied to.
-
-Status callbacks map Meta message IDs to outbound rows. The monotonic policy is `pending/uncertain → sent → delivered → read`; duplicate or older callbacks do nothing. `failed` is terminal and stores only a sanitized failure summary. Unknown provider IDs are safely acknowledged. Raw inbound webhook subsets remain stored where already justified; new outbound requests do not store raw provider responses.
-
-## Uncertain-message reconciliation
-
-`uncertain` means the provider call outcome could not be determined locally: Meta may
-or may not have accepted it. Timeouts after request transmission, dropped connections,
-malformed success responses, and success responses without a provider message ID are
-ambiguous. This differs from pending, confirmed sent, delivered/read, and confirmed
-failed states.
-
-The platform never blindly resends an uncertain message. A resend could duplicate a
-message that Meta accepted before the response was lost. Its prepaid reservation stays
-active: total balance is unchanged, available balance excludes the reservation, and no
-usage/debit exists.
-
-Meta Cloud API does not provide this platform a reliable lookup by local message UUID
-or idempotency key. The explicit provider capability is therefore “lookup unavailable.”
-Resolution relies on a webhook that can be matched using a captured Meta message ID or
-an operator reviewing external evidence. If no provider ID was captured, an otherwise
-valid late webhook cannot be linked to the local row automatically.
-
-Operator commands are:
-
-```bash
-uv run python -m app.cli list-uncertain-messages --application school-management
-uv run python -m app.cli show-uncertain-message \
-  --application school-management --message-id <uuid>
-uv run python -m app.cli reconcile-uncertain-message \
-  --application school-management --message-id <uuid> \
-  --outcome unknown --reason provider_lookup_unavailable
-uv run python -m app.cli reconcile-uncertain-message \
-  --application school-management --message-id <uuid> \
-  --outcome accepted --provider-message-id <wamid> --reason provider_console_confirmed
-uv run python -m app.cli reconcile-uncertain-message \
-  --application school-management --message-id <uuid> \
-  --outcome rejected --reason provider_rejection_confirmed
-uv run python -m app.cli release-uncertain-reservation \
-  --application school-management --message-id <uuid> \
-  --reason acceptance_could_not_be_confirmed
-```
-
-`APP_BILLING_UNCERTAIN_RECONCILE_AFTER_MINUTES` defaults to 1440. It only controls
-stale discovery and release eligibility; it never schedules or automatically releases
-anything. `--force` is an explicit operator override for a newer reservation.
-
-Accepted resolution requires a provider message ID and atomically marks sent, charges
-once, writes one usage row, and consumes the reservation. Rejected resolution marks
-failed and releases without charging. Unknown resolution records an audit attempt and
-keeps the hold. Manual release records a distinct `released` reconciliation status,
-marks the external lifecycle failed, and is idempotent.
-
-If a linkable callback proves acceptance after manual release, provider truth is still
-recorded. The platform charges from currently available prepaid funds when possible.
-If those funds are no longer available, it leaves the wallet non-negative, creates one
-open `late_provider_acceptance_after_release` billing exception. The exception snapshots
-the original amount and currency; later pricing-rule changes do not alter it. It does
-not silently create postpaid debt or resend.
-
-Billing exceptions are Fazilabs operator concerns and have no application-key write API.
-They remain permanently auditable as `open`, `resolved_charged`, or `resolved_waived`:
-
-```bash
-uv run python -m app.cli list-billing-exceptions \
-  --application school-management --status open
-uv run python -m app.cli show-billing-exception \
-  --application school-management --exception-id <uuid>
-uv run python -m app.cli credit-billing-account \
-  --application school-management --external-id <school-id> \
-  --amount <major-units> --currency KES --reference <unique-topup-reference>
-uv run python -m app.cli resolve-billing-exception \
-  --application school-management --exception-id <uuid> \
-  --resolution charge --reason wallet_replenished
-uv run python -m app.cli resolve-billing-exception \
-  --application school-management --exception-id <uuid> \
-  --resolution waive --reason customer_service_waiver
-```
-
-A charge resolution locks and validates the provider-accepted outbound, exception,
-released reservation, and wallet account; it then writes one historical-price usage row
-and one debit in the same transaction. Insufficient available balance leaves the
-exception open and makes no financial change. A waiver writes no usage or debit. Same-
-resolution replays are idempotent, while attempts to reverse charged/waived history are
-rejected. Wallet credits never settle exceptions automatically.
-
-Operator SOP: (1) list open exceptions, (2) inspect the provider evidence and snapshot,
-(3) decide charge or waive, (4) top up explicitly if charging requires funds, (5) run the
-resolution command, and (6) verify exception status plus balance and monthly usage.
-Current limitations are deliberate: no automatic settlement, partial adjustment, debt,
-postpaid receivable, payment gateway, invoice, dashboard, or scheduler.
-
-Reconciliation locks outbound message → reservation → billing account. Exception
-resolution locks outbound message → exception → reservation → billing account. Final status,
-usage, debit, reservation, audit, and exception changes share one local transaction.
-Database uniqueness preserves one reservation, usage charge, debit reference, and
-late-acceptance exception per outbound message. Webhook and CLI replays are safe.
-
-## Migrations and checks
-
-Historical revisions are unchanged. Revision `20260829_0006` adds application ownership, parameter schemas, provider/language fields, and outbound template audit snapshots without deleting existing messaging rows.
-
-```bash
-uv run alembic upgrade head
 uv run alembic current
-uv run alembic check
+curl --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/ready
+```
+
+`/health` is a lightweight liveness check and does not access PostgreSQL. `/ready` performs a
+minimal database connectivity check and returns HTTP `503` with a sanitized response when the
+database is unavailable.
+
+`doctor --check-reachability` makes an HTTP health request to the configured public URL. The plain
+`doctor` command does not contact providers.
+
+## Testing
+
+Integration tests require an explicitly isolated PostgreSQL database in
+`APP_TEST_DATABASE_URL`. Test setup rejects URLs whose database name does not contain `test`; never
+point tests at development or production data.
+
+```bash
+export APP_TEST_DATABASE_URL='postgresql+asyncpg://<user>:<password>@127.0.0.1:5432/fazilabs_messaging_test'
+export APP_DATABASE_URL="$APP_TEST_DATABASE_URL"
+uv run alembic upgrade head
+uv run pytest
 uv run ruff check .
 uv run ruff format --check .
-uv run pytest
+uv run alembic check
+git diff --check
 ```
 
-Set `APP_TEST_DATABASE_URL` to an isolated database whose name contains `test` to
-enable PostgreSQL idempotency and billing concurrency tests. Never use the development
-`whatsapp_agent` database. One exact setup is:
+Provider tests use HTTP mocks/fakes and must never contact Meta or Advanta.
+
+## CLI operations
+
+Run `uv run python -m app.cli --help` and per-command `--help` for complete flags. Major groups are:
+
+- Applications: `create-application`, `list-applications`, `show-application`,
+  `require-application-billing`, `allow-application-unbilled`.
+- API keys: `create-api-key`, `list-api-keys`, `revoke-api-key`.
+- Templates: `create-template`, `update-template`, `list-templates`, `enable-template`,
+  `disable-template`.
+- Billing accounts: `create-billing-account`, `list-billing-accounts`,
+  `show-billing-account`, `activate-billing-account`, `suspend-billing-account`,
+  `credit-billing-account`, `show-balance`, `list-wallet-transactions`,
+  `monthly-usage-summary`.
+- Pricing: `create-pricing-rule`, `list-pricing-rules`, `disable-pricing-rule`.
+- Advanta operator balance: `advanta-balance`. This is provider credit, not a customer wallet.
+- Uncertain messages: `list-uncertain-messages` (all by default),
+  `list-uncertain-messages --stale-only`, `show-uncertain-message`,
+  `reconcile-uncertain-message`, `release-uncertain-reservation`.
+- Billing exceptions: `list-billing-exceptions`, `show-billing-exception`,
+  `resolve-billing-exception`.
+- Diagnostics: `doctor` and optional `doctor --check-reachability`.
+
+Reconciliation and wallet commands are operator actions with financial consequences. Investigate
+provider evidence first and retain an external audit reason/reference.
+
+## Swagger and OpenAPI
+
+With the API running locally:
+
+- Swagger UI: `http://127.0.0.1:8000/docs`
+- ReDoc: `http://127.0.0.1:8000/redoc`
+- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
+
+Swagger's **Authorize** control accepts the raw application API key as a bearer credential. Example
+requests use fictional numbers and tokens. Provider-facing webhooks intentionally do not use the
+consumer API-key scheme.
+
+Production deployment endpoints are:
+
+- Machine API base: `https://api.messaging.fazicore.app`
+- Swagger UI: `https://messaging.fazicore.app/docs`
+- ReDoc: `https://messaging.fazicore.app/redoc`
+- OpenAPI JSON: `https://messaging.fazicore.app/openapi.json`
+- Liveness: `https://api.messaging.fazicore.app/health`
+- Readiness: `https://api.messaging.fazicore.app/ready`
+- Meta callback: `https://api.messaging.fazicore.app/webhooks/whatsapp`
+- Advanta callback: `https://api.messaging.fazicore.app/webhooks/advanta`
+
+These hostnames are reverse-proxy/deployment configuration. They are not embedded in messaging
+business logic.
+
+## Configuration
+
+Settings use the `APP_` prefix. Store production values in a secret manager or protected deployment
+environment, not source control.
+
+| Variable | Purpose |
+| --- | --- |
+| `APP_NAME` | Runtime service name returned at `/` |
+| `APP_ENVIRONMENT` | `development`, `test`, `staging`, or `production` |
+| `APP_DEBUG` | FastAPI debug behavior; must be false in staging/production |
+| `APP_HOST`, `APP_PORT` | Server bind defaults for deployment tooling |
+| `APP_LOG_LEVEL` | Root structured-log level |
+| `APP_DATABASE_URL` | PostgreSQL SQLAlchemy/asyncpg URL; required in staging/production |
+| `APP_WHATSAPP_VERIFY_TOKEN` | Meta subscription verification secret |
+| `APP_WHATSAPP_APP_SECRET` | Meta webhook signature secret |
+| `APP_WHATSAPP_ACCESS_TOKEN` | Meta Cloud API credential |
+| `APP_WHATSAPP_PHONE_NUMBER_ID` | Server-owned WhatsApp sender identity |
+| `APP_WHATSAPP_API_VERSION` | Meta Graph API version |
+| `APP_PUBLIC_WEBHOOK_BASE_URL` | Public HTTPS base URL used by diagnostics/operations |
+| `APP_ADVANTA_BASE_URL` | Advanta API base URL |
+| `APP_ADVANTA_API_KEY` | Advanta credential |
+| `APP_ADVANTA_PARTNER_ID` | Advanta partner credential |
+| `APP_ADVANTA_SENDER_ID` | Server-owned Advanta sender ID |
+| `APP_ADVANTA_PROVIDER_COST_PER_PAGE_MINOR` | Nullable trusted provider-cost snapshot per SMS page |
+| `APP_BILLING_UNCERTAIN_RECONCILE_AFTER_MINUTES` | Safety age used by stale reconciliation operations |
+| `APP_TEST_DATABASE_URL` | Test-only isolated PostgreSQL URL consumed by integration tests |
+
+Production/staging settings currently validate all Meta credentials even if only SMS is intended.
+Advanta settings are optional at startup; an SMS attempt returns provider-unavailable if incomplete.
+Deployment validation must therefore check required channel configuration explicitly.
+
+## Deployment
+
+The current runtime is one stateless ASGI API process plus PostgreSQL. A minimal first deployment
+should run a pinned repository build under Uvicorn behind Nginx, with environment secrets injected
+at runtime and Alembic run as a separate release step. Both public hostnames proxy to the same
+FastAPI deployment.
+
+Example process command:
 
 ```bash
-createdb fazilabs_messaging_test
-APP_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fazilabs_messaging_test \
-  uv run alembic upgrade head
-APP_TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/fazilabs_messaging_test \
-  uv run pytest tests/test_whatsapp_postgres.py tests/test_message_api_postgres.py \
-  tests/test_billing_postgres.py
+uv run uvicorn app.main:app \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --proxy-headers \
+  --forwarded-allow-ips 127.0.0.1
 ```
 
-## Security and privacy
+This command is for Nginx running on the same host. Keep Uvicorn private and trust forwarded headers
+only from the proxy address; never use `--forwarded-allow-ips '*'`. If the proxy moves to a distinct
+private host, replace the bind and trust values with the specific private network addresses.
 
-- Never log API keys, authorization headers, Meta tokens, message bodies, or full phone numbers.
-- API keys are shown once, salted and strongly hashed at rest, and independently revocable.
-- Meta access tokens are platform secrets, never caller credentials.
-- Provider diagnostics are sanitized and length-limited.
-- Payload and field limits provide an initial abuse boundary; application-level distributed rate limiting is intentionally deferred.
-- Metadata is JSONB and domain-neutral. This service has no School, Student, Invoice, Parent, Customer, CRM, or end-user account models.
+The production Nginx examples are:
 
-## Real application test (manual only)
+- [`deployment/nginx/fazilabs-messaging.conf.example`](deployment/nginx/fazilabs-messaging.conf.example)
+- [`deployment/nginx/fazilabs-messaging-proxy.conf.example`](deployment/nginx/fazilabs-messaging-proxy.conf.example)
 
-First replace any exposed development API key using the safe rotation procedure above. Create and obtain Meta approval for one genuine template, then map its exact approved name/language with `create-template`. Start FastAPI and a reachable HTTPS tunnel, send one `/api/v1/messages/template` request with a unique idempotency key, and confirm `sent → delivered`. Open the message to optionally confirm `read_at`. Repeat the exact request and confirm the same platform UUID is returned with no duplicate delivery.
+Nginx terminates HTTPS, redirects HTTP to HTTPS, rejects unknown hosts, applies a 1 MiB request-body
+limit, and provides bounded edge request rates. `messaging.fazicore.app` exposes only documentation;
+`api.messaging.fazicore.app` exposes `/api/v1/*`, `/webhooks/*`, `/health`, and `/ready`. Certificate
+paths are placeholders; this repository does not provision DNS or certificates.
 
-Do not run that external test from automated tests. SMS, email, an admin UI, distributed rate limiting, media headers, and template buttons remain future work.
+Do not run multiple migration jobs concurrently. The service has no startup migration, queue worker,
+scheduler, or local persistent-data requirement. PostgreSQL is the system of record and needs
+managed backups and restore testing.
+
+Before production, configure Meta's callback as
+`https://api.messaging.fazicore.app/webhooks/whatsapp` and Advanta's DLR callback as
+`https://api.messaging.fazicore.app/webhooks/advanta`. Use `/health` for liveness and `/ready` for
+traffic admission/readiness. The selected platform must aggregate JSON stdout/stderr logs and alert
+on API errors, provider failures, uncertain messages, billing exceptions, database health, and
+webhook failure or silence.
+
+## Security and operational notes
+
+- Keep consumer and provider credentials server-side; rotate them through the deployment secret
+  store and revoke old application keys.
+- Do not log authorization headers, message bodies, recipients, template parameter values, result
+  URLs/tokens, or provider request payloads.
+- Require production HTTPS and restrict direct backend ingress to the reverse proxy.
+- Meta POST callbacks are signature-verified before JSON parsing. Advanta DLR verification is a
+  known limitation. The Nginx example includes a disabled allowlist block: enable it only after
+  Advanta confirms stable source CIDRs; do not guess provider addresses. Until then, retain HTTPS,
+  exact-path routing, request-size limits, rate limits, monitoring, and restricted backend ingress.
+- Treat idempotency keys as non-secret business identifiers and avoid sensitive data in them.
+- Never automatically retry `uncertain` sends; use evidence-based reconciliation.
+- No CORS, trusted-host middleware, or application-level rate limiter is currently configured.
+  Browser access is not required for normal server-to-server consumers. Enforce host/ingress and
+  initial rate controls at the edge until application policy is added.
+- `/docs`, `/redoc`, and `/openapi.json` are public by default. Decide explicitly whether the
+  production edge keeps them public, restricts them, or disables them.
+
+## Current limitations and future work
+
+- Advanta DLR callbacks lack provider-verified authentication in the available contract.
+- There is no bulk send, automatic cross-channel fallback, queue/scheduler, or automatic uncertain
+  reconciliation.
+- There is no built-in application rate limiting or deployment manifest/container image.
+- Provider delivery-report polling exists as a client capability but no polling daemon is included.

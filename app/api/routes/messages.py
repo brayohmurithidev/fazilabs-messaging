@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.dependencies import AuthenticatedApplication
@@ -16,6 +16,7 @@ from app.schemas.messages import (
     TemplateMessageRequest,
     TextMessageRequest,
 )
+from app.services.advanta_client import AdvantaClient
 from app.services.billing import (
     AmbiguousPricingRuleError,
     BillingAccountNotFoundError,
@@ -27,13 +28,35 @@ from app.services.messaging import (
     BillingAccountRequiredError,
     IdempotencyConflictError,
     MessagingService,
+    ProviderUnavailableError,
     TemplateNotFoundError,
     TemplateParameterError,
     TemplateUnavailableError,
 )
 from app.services.whatsapp_client import WhatsAppCloudAPIClient
 
-router = APIRouter(prefix="/api/v1/messages", tags=["messages"])
+router = APIRouter(prefix="/api/v1/messages", tags=["Messages"])
+
+IDEMPOTENCY_DESCRIPTION = (
+    "Required caller-generated, non-secret identity for one logical send (8-200 characters). "
+    "Retry with the same key and identical request to reuse the original message without another "
+    "provider call or charge. Reusing it with a changed request returns HTTP 409."
+)
+
+SEND_RESPONSES = {
+    400: {"description": "The Idempotency-Key header is missing or invalid."},
+    401: {"description": "Missing or invalid application API key."},
+    402: {"description": "The customer-funded billing account has insufficient balance."},
+    403: {"description": "The application or billing account is disabled/suspended."},
+    404: {"description": "The billing account or semantic template was not found."},
+    409: {"description": "Idempotency conflict, unavailable template, or ambiguous pricing."},
+    422: {
+        "description": (
+            "Request, template parameters, recipient, or billing requirement failed validation."
+        )
+    },
+    503: {"description": "The selected message provider is not configured."},
+}
 
 
 def billing_http_error(exc: Exception) -> HTTPException:
@@ -65,23 +88,31 @@ def billing_http_error(exc: Exception) -> HTTPException:
 
 def get_messaging_service(request: Request) -> MessagingService:
     settings = request.app.state.settings
-    if not all(
+    whatsapp = None
+    if all(
         (
             settings.whatsapp_api_version,
             settings.whatsapp_phone_number_id,
             settings.whatsapp_access_token,
         )
     ):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="WhatsApp provider is not configured",
-        )
-    return MessagingService(
-        WhatsAppCloudAPIClient(
+        whatsapp = WhatsAppCloudAPIClient(
             api_version=settings.whatsapp_api_version,
             phone_number_id=settings.whatsapp_phone_number_id,
             access_token=settings.whatsapp_access_token,
         )
+    advanta = None
+    if settings.advanta_base_url and settings.advanta_api_key and settings.advanta_partner_id:
+        advanta = AdvantaClient(
+            base_url=settings.advanta_base_url,
+            api_key=settings.advanta_api_key,
+            partner_id=settings.advanta_partner_id,
+            sender_id=settings.advanta_sender_id,
+        )
+    return MessagingService(
+        whatsapp,
+        advanta_client=advanta,
+        advanta_provider_cost_per_page_minor=settings.advanta_provider_cost_per_page_minor,
     )
 
 
@@ -103,16 +134,32 @@ def response_for(message: OutboundMessage, application_slug: str) -> MessageResp
         delivered_at=message.delivered_at,
         read_at=message.read_at,
         failed_at=message.failed_at,
+        sms_character_count=getattr(message, "sms_character_count", None),
+        sms_page_count=getattr(message, "sms_page_count", None),
     )
 
 
-@router.post("/text", response_model=MessageResponse, summary="Send a WhatsApp text message")
+@router.post(
+    "/text",
+    response_model=MessageResponse,
+    summary="Send a WhatsApp text message",
+    description=(
+        "Sends provider-independent free-form text over WhatsApp. SMS text sends are not "
+        "supported; SMS is template-only. Billing is governed by the authenticated application's "
+        "billing policy. The response may be `uncertain` when provider acceptance cannot safely "
+        "be determined; do not retry with a new idempotency key."
+    ),
+    response_description="The new message, or the original message on an exact idempotent replay.",
+    responses=SEND_RESPONSES,
+)
 async def send_text_message(
-    body: TextMessageRequest,
+    body: Annotated[TextMessageRequest, Body()],
     application: AuthenticatedApplication,
     session: Annotated[AsyncSession, Depends(get_db_session)],
     service: Annotated[MessagingService, Depends(get_messaging_service)],
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", description=IDEMPOTENCY_DESCRIPTION)
+    ] = None,
 ) -> MessageResponse:
     if idempotency_key is None:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
@@ -120,6 +167,8 @@ async def send_text_message(
         raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
     try:
         message = await service.send_text(session, application, idempotency_key, body)
+    except ProviderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Message provider is not configured") from exc
     except IdempotencyConflictError as exc:
         raise HTTPException(
             status_code=409, detail="Idempotency key was used with a different payload"
@@ -138,14 +187,72 @@ async def send_text_message(
 
 
 @router.post(
-    "/template", response_model=MessageResponse, summary="Send an approved WhatsApp template"
+    "/template",
+    response_model=MessageResponse,
+    summary="Send a semantic message template",
+    description=(
+        "Resolves an application-scoped semantic template for the requested channel, validates "
+        "its named parameters, and sends it through the configured provider. WhatsApp mappings "
+        "may contain approved BODY and dynamic URL-button parameters. SMS mappings render and "
+        "analyze text server-side (160 characters per page, at most 6 pages/960 characters; "
+        "emoji are rejected). Billing mode and the SMS standard/transactional route come from "
+        "the mapping and cannot be selected by the caller."
+    ),
+    response_description="The new message, or the original message on an exact idempotent replay.",
+    responses=SEND_RESPONSES,
 )
 async def send_template_message(
-    body: TemplateMessageRequest,
+    body: Annotated[
+        TemplateMessageRequest,
+        Body(
+            openapi_examples={
+                "whatsapp": {
+                    "summary": "WhatsApp approved template",
+                    "value": {
+                        "channel": "whatsapp",
+                        "to": "254700000000",
+                        "template": "student_results_ready",
+                        "parameters": {
+                            "parent_name": "Amina",
+                            "student_name": "Baraka",
+                            "term": "Term 2",
+                            "results_path": "example-access-token",
+                        },
+                        "billing_account": "school-example-001",
+                        "metadata": {
+                            "source_type": "student_result",
+                            "source_id": "result-example-001",
+                        },
+                    },
+                },
+                "sms": {
+                    "summary": "Advanta SMS template",
+                    "value": {
+                        "channel": "sms",
+                        "to": "254700000000",
+                        "template": "student_results_ready",
+                        "parameters": {
+                            "parent_name": "Amina",
+                            "student_name": "Baraka",
+                            "term": "Term 2",
+                            "results_url": ("https://example.com/results/example-access-token"),
+                        },
+                        "billing_account": "school-example-001",
+                        "metadata": {
+                            "source_type": "student_result",
+                            "source_id": "result-example-001",
+                        },
+                    },
+                },
+            }
+        ),
+    ],
     application: AuthenticatedApplication,
     session: Annotated[AsyncSession, Depends(get_db_session)],
     service: Annotated[MessagingService, Depends(get_messaging_service)],
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key", description=IDEMPOTENCY_DESCRIPTION)
+    ] = None,
 ) -> MessageResponse:
     if idempotency_key is None:
         raise HTTPException(status_code=400, detail="Idempotency-Key header is required")
@@ -153,6 +260,8 @@ async def send_template_message(
         raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
     try:
         message = await service.send_template(session, application, idempotency_key, body)
+    except ProviderUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="Message provider is not configured") from exc
     except TemplateNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Template not found") from exc
     except TemplateUnavailableError as exc:
@@ -176,7 +285,21 @@ async def send_template_message(
     return response_for(message, application.slug)
 
 
-@router.get("/{message_id}", response_model=MessageResponse, summary="Get a message")
+@router.get(
+    "/{message_id}",
+    response_model=MessageResponse,
+    summary="Get a message",
+    description=(
+        "Gets one message owned by the authenticated application. Statuses are `pending`, "
+        "`sent`, `delivered`, `read`, `failed`, or `uncertain`. `uncertain` means provider "
+        "acceptance could not safely be determined and Messaging will not blindly resend."
+    ),
+    response_description="The application-owned message and its current lifecycle status.",
+    responses={
+        401: {"description": "Missing or invalid application API key."},
+        404: {"description": "Message not found for this application."},
+    },
+)
 async def get_message(
     message_id: UUID,
     application: AuthenticatedApplication,
@@ -190,7 +313,17 @@ async def get_message(
     return response_for(message, application.slug)
 
 
-@router.get("", response_model=MessageListResponse, summary="List application messages")
+@router.get(
+    "",
+    response_model=MessageListResponse,
+    summary="List application messages",
+    description=(
+        "Lists messages owned by the authenticated application, newest first, with optional "
+        "lifecycle, channel, source, and creation-time filters."
+    ),
+    response_description="A paginated application-scoped message list.",
+    responses={401: {"description": "Missing or invalid application API key."}},
+)
 async def list_messages(
     application: AuthenticatedApplication,
     session: Annotated[AsyncSession, Depends(get_db_session)],

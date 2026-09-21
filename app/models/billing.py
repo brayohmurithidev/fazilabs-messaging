@@ -56,7 +56,7 @@ class BillingAccount(Base):
 class PricingRule(Base):
     __tablename__ = "pricing_rules"
     __table_args__ = (
-        CheckConstraint("channel IN ('whatsapp')", name="pricing_rule_channel"),
+        CheckConstraint("channel IN ('whatsapp', 'sms')", name="pricing_rule_channel"),
         CheckConstraint("message_kind IN ('text', 'template')", name="pricing_rule_kind"),
         CheckConstraint(
             "billing_category IS NULL OR billing_category IN "
@@ -158,10 +158,29 @@ class WalletTransaction(Base):
 class MessageUsage(Base):
     __tablename__ = "message_usage"
     __table_args__ = (
-        CheckConstraint("channel IN ('whatsapp')", name="message_usage_channel"),
+        CheckConstraint("channel IN ('whatsapp', 'sms')", name="message_usage_channel"),
         CheckConstraint("message_kind IN ('text', 'template')", name="message_usage_kind"),
-        CheckConstraint("customer_price_minor > 0", name="message_usage_positive_price"),
-        CheckConstraint("billing_status IN ('charged')", name="message_usage_status"),
+        CheckConstraint("customer_price_minor >= 0", name="message_usage_nonnegative_price"),
+        CheckConstraint(
+            "billing_status IN ('charged', 'platform_funded')", name="message_usage_status"
+        ),
+        CheckConstraint(
+            "billing_mode IN ('customer', 'platform')", name="message_usage_billing_mode"
+        ),
+        CheckConstraint(
+            "(channel = 'whatsapp' AND sms_page_count IS NULL) OR "
+            "(channel = 'sms' AND sms_page_count BETWEEN 1 AND 6)",
+            name="message_usage_sms_pages",
+        ),
+        CheckConstraint(
+            "(billing_mode = 'customer' AND billing_account_id IS NOT NULL "
+            "AND pricing_rule_id IS NOT NULL AND currency IS NOT NULL "
+            "AND customer_price_minor > 0 AND billing_status = 'charged') OR "
+            "(billing_mode = 'platform' AND pricing_rule_id IS NULL "
+            "AND currency IS NULL AND customer_price_minor = 0 "
+            "AND billing_status = 'platform_funded')",
+            name="message_usage_funding_consistency",
+        ),
         UniqueConstraint("outbound_message_id", name="uq_message_usage_outbound"),
     )
 
@@ -169,8 +188,8 @@ class MessageUsage(Base):
     application_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("messaging_applications.id", ondelete="RESTRICT")
     )
-    billing_account_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="RESTRICT")
+    billing_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("billing_accounts.id", ondelete="RESTRICT"), nullable=True
     )
     outbound_message_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("outbound_messages.id", ondelete="RESTRICT")
@@ -179,11 +198,15 @@ class MessageUsage(Base):
     message_kind: Mapped[str] = mapped_column(String(24), nullable=False)
     billing_category: Mapped[str | None] = mapped_column(String(24), nullable=True)
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
-    pricing_rule_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("pricing_rules.id", ondelete="RESTRICT")
+    billing_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="customer", server_default="customer"
     )
-    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    pricing_rule_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("pricing_rules.id", ondelete="RESTRICT"), nullable=True
+    )
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
     provider_cost_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    customer_price_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sms_page_count: Mapped[int | None] = mapped_column(nullable=True)
+    customer_price_minor: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     billing_status: Mapped[str] = mapped_column(String(16), nullable=False, default="charged")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

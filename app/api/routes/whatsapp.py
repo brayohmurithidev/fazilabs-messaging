@@ -13,14 +13,23 @@ from app.services.whatsapp_webhook import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/webhooks/whatsapp", tags=["whatsapp-webhooks"])
+router = APIRouter(prefix="/webhooks/whatsapp", tags=["Webhooks"])
 
 
 def get_webhook_service(request: Request) -> WhatsAppWebhookService:
     return WhatsAppWebhookService()
 
 
-@router.get("")
+@router.get(
+    "",
+    summary="Verify the Meta webhook",
+    description=(
+        "Provider-facing Meta subscription verification endpoint. Meta supplies the verification "
+        "query parameters; a matching server-side verify token returns the plain-text challenge."
+    ),
+    response_description="The plain-text Meta challenge when verification succeeds.",
+    responses={403: {"description": "Verification token or mode did not match."}},
+)
 async def verify_webhook(
     request: Request,
     mode: Annotated[str | None, Query(alias="hub.mode")] = None,
@@ -38,7 +47,20 @@ async def verify_webhook(
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Verification failed")
 
 
-@router.post("")
+@router.post(
+    "",
+    summary="Receive Meta webhook events",
+    description=(
+        "Provider-facing receiver for inbound WhatsApp messages and outbound delivery/read "
+        "updates. The raw body must carry a valid `X-Hub-Signature-256` generated with the "
+        "configured Meta app secret. Duplicate events are handled idempotently."
+    ),
+    response_description="The verified event was accepted for synchronous processing.",
+    responses={
+        400: {"description": "The signed body is not valid JSON."},
+        401: {"description": "The Meta signature is missing or invalid."},
+    },
+)
 async def receive_webhook(
     request: Request,
     session: Annotated[AsyncSession, Depends(get_db_session)],
