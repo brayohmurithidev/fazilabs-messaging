@@ -3,6 +3,7 @@ import asyncio
 import json
 import re
 from datetime import UTC, datetime, timedelta
+from typing import Any
 from uuid import UUID
 
 import httpx
@@ -25,6 +26,7 @@ from app.models.message_template import MessageTemplate
 from app.models.messaging_application import MessagingApiKey, MessagingApplication
 from app.models.reconciliation import BillingException, MessageReconciliationAttempt
 from app.models.whatsapp_outbound_message import OutboundMessage
+from app.services.advanta_client import AdvantaAPIError, AdvantaClient
 from app.services.billing import (
     BillingService,
     CurrencyMismatchError,
@@ -45,7 +47,12 @@ from app.services.reconciliation import (
     ReconciliationService,
     ReconciliationTooRecentError,
 )
-from app.services.template_parameters import InvalidTemplateSchemaError, validate_parameter_schema
+from app.services.sms import InvalidSmsError, sms_template_parameters
+from app.services.template_parameters import (
+    InvalidTemplateSchemaError,
+    semantic_parameter_names,
+    validate_parameter_schema,
+)
 
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEMPLATE_KEY_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
@@ -73,6 +80,43 @@ async def create_application(args: argparse.Namespace) -> None:
             MessagingApplication(name=args.name, slug=args.slug, description=args.description)
         )
     print(f"Created application: {args.slug}")
+
+
+async def list_applications(args: argparse.Namespace) -> None:
+    async with async_session_factory() as session:
+        applications = list(
+            (
+                await session.scalars(
+                    select(MessagingApplication).order_by(MessagingApplication.slug)
+                )
+            ).all()
+        )
+    print("id\tslug\tname\tstatus\tbilling_required\tcreated_at")
+    for application in applications:
+        print(
+            f"{application.id}\t{application.slug}\t{application.name}\t"
+            f"{application.status}\t{application.billing_required}\t{application.created_at}"
+        )
+
+
+async def show_application(args: argparse.Namespace) -> None:
+    async with async_session_factory() as session:
+        application = await _application(session, args.application)
+        print(
+            f"id={application.id}\nslug={application.slug}\nname={application.name}\n"
+            f"description={application.description or '-'}\nstatus={application.status}\n"
+            f"billing_required={application.billing_required}\n"
+            f"created_at={application.created_at}\nupdated_at={application.updated_at}"
+        )
+
+
+async def set_application_billing_policy(args: argparse.Namespace) -> None:
+    required = args.command == "require-application-billing"
+    async with async_session_factory() as session, session.begin():
+        application = await _application(session, args.application)
+        application.billing_required = required
+    policy = "billing-required" if required else "unbilled traffic allowed"
+    print(f"Application {args.application} is now {policy}")
 
 
 async def create_api_key(args: argparse.Namespace) -> None:
@@ -136,25 +180,75 @@ async def revoke_api_key(args: argparse.Namespace) -> None:
         print(f"Revoked API key: {key.key_prefix}")
 
 
-def _schema(value: str) -> dict[str, list[str]]:
+def _schema(value: str) -> dict[str, Any]:
     try:
         return validate_parameter_schema(json.loads(value))
     except (json.JSONDecodeError, InvalidTemplateSchemaError) as exc:
         raise SystemExit(f"Invalid parameter schema: {exc}") from exc
 
 
+def _validate_template_mapping_fields(
+    *,
+    channel: str,
+    provider: str,
+    provider_template_name: str | None,
+    language: str | None,
+    sms_body: str | None,
+    sms_route: str | None,
+    parameter_schema: dict[str, Any],
+    billing_category: str,
+    billing_mode: str,
+) -> None:
+    if channel == "whatsapp":
+        if provider != "meta":
+            raise SystemExit("Only provider 'meta' is supported for WhatsApp")
+        if (
+            not provider_template_name
+            or not provider_template_name.strip()
+            or len(provider_template_name) > 512
+        ):
+            raise SystemExit("provider template name must contain 1 to 512 characters")
+        if not language or not re.fullmatch(r"[A-Za-z]{2,3}(?:_[A-Za-z]{2})?", language):
+            raise SystemExit("language must be a Meta language code such as en or en_US")
+        if sms_body is not None or sms_route is not None:
+            raise SystemExit("WhatsApp templates must not specify SMS configuration")
+    elif channel == "sms":
+        if provider != "advanta":
+            raise SystemExit("SMS templates require provider 'advanta'")
+        if provider_template_name is not None or language is not None:
+            raise SystemExit("SMS templates must not specify provider template name or language")
+        if not sms_body or sms_route not in {"standard", "transactional"}:
+            raise SystemExit("SMS templates require --sms-body and a valid --sms-route")
+        try:
+            if sms_template_parameters(sms_body) != parameter_schema["body"]:
+                raise SystemExit("SMS placeholders must match declared body parameters in order")
+        except InvalidSmsError as exc:
+            raise SystemExit(str(exc)) from exc
+        if parameter_schema["buttons"]:
+            raise SystemExit("SMS templates do not support button parameters")
+    else:
+        raise SystemExit("channel must be whatsapp or sms")
+    if billing_category not in {"utility", "authentication", "marketing"}:
+        raise SystemExit("billing category must be utility, authentication, or marketing")
+    if billing_mode not in {"customer", "platform"}:
+        raise SystemExit("billing mode must be customer or platform")
+
+
 async def create_template(args: argparse.Namespace) -> None:
     if len(args.key) > 100 or not TEMPLATE_KEY_PATTERN.fullmatch(args.key):
         raise SystemExit("template key must use lowercase words separated by underscores")
-    if args.channel != "whatsapp":
-        raise SystemExit("Only channel 'whatsapp' is supported")
-    if args.provider != "meta":
-        raise SystemExit("Only provider 'meta' is supported")
-    if not args.provider_template_name.strip() or len(args.provider_template_name) > 512:
-        raise SystemExit("provider template name must contain 1 to 512 characters")
-    if not re.fullmatch(r"[A-Za-z]{2,3}(?:_[A-Za-z]{2})?", args.language):
-        raise SystemExit("language must be a Meta language code such as en or en_US")
     parameter_schema = _schema(args.parameter_schema)
+    _validate_template_mapping_fields(
+        channel=args.channel,
+        provider=args.provider,
+        provider_template_name=args.provider_template_name,
+        language=args.language,
+        sms_body=args.sms_body,
+        sms_route=args.sms_route,
+        parameter_schema=parameter_schema,
+        billing_category=args.billing_category,
+        billing_mode=args.billing_mode,
+    )
     try:
         async with async_session_factory() as session, session.begin():
             application = await _application(session, args.application)
@@ -166,14 +260,90 @@ async def create_template(args: argparse.Namespace) -> None:
                     provider=args.provider,
                     provider_template_name=args.provider_template_name,
                     language_code=args.language,
+                    sms_body=args.sms_body,
+                    provider_route=args.sms_route,
                     description=args.description,
                     parameter_schema=parameter_schema,
                     billing_category=args.billing_category,
+                    billing_mode=args.billing_mode,
                 )
             )
     except IntegrityError as exc:
         raise SystemExit("Template already exists for this application and channel") from exc
     print(f"Created template mapping: {args.application}/{args.key}/{args.channel}")
+
+
+async def update_template(args: argparse.Namespace) -> None:
+    sms_body_arg = getattr(args, "sms_body", None)
+    sms_route_arg = getattr(args, "sms_route", None)
+    supplied = {
+        "provider": args.provider,
+        "provider_template_name": args.provider_template_name,
+        "language_code": args.language,
+        "description": args.description,
+        "parameter_schema": args.parameter_schema,
+        "billing_category": args.billing_category,
+        "billing_mode": args.billing_mode,
+        "sms_body": sms_body_arg,
+        "provider_route": sms_route_arg,
+    }
+    if all(value is None for value in supplied.values()):
+        raise SystemExit("At least one template field must be supplied for update")
+    parameter_schema = _schema(args.parameter_schema) if args.parameter_schema is not None else None
+    async with async_session_factory() as session, session.begin():
+        application = await _application(session, args.application)
+        template = await session.scalar(
+            select(MessageTemplate).where(
+                MessageTemplate.application_id == application.id,
+                MessageTemplate.template_key == args.key,
+                MessageTemplate.channel == args.channel,
+            )
+        )
+        if template is None:
+            raise SystemExit("Template not found for application")
+        provider = args.provider if args.provider is not None else template.provider
+        provider_template_name = (
+            args.provider_template_name
+            if args.provider_template_name is not None
+            else template.provider_template_name
+        )
+        language = args.language if args.language is not None else template.language_code
+        billing_category = (
+            args.billing_category
+            if args.billing_category is not None
+            else template.billing_category
+        )
+        billing_mode = args.billing_mode if args.billing_mode is not None else template.billing_mode
+        sms_body = sms_body_arg if sms_body_arg is not None else getattr(template, "sms_body", None)
+        sms_route = (
+            sms_route_arg
+            if sms_route_arg is not None
+            else getattr(template, "provider_route", None)
+        )
+        effective_schema = parameter_schema or template.parameter_schema
+        _validate_template_mapping_fields(
+            channel=template.channel,
+            provider=provider,
+            provider_template_name=provider_template_name,
+            language=language,
+            sms_body=sms_body,
+            sms_route=sms_route,
+            parameter_schema=effective_schema,
+            billing_category=billing_category,
+            billing_mode=billing_mode,
+        )
+        template.provider = provider
+        template.provider_template_name = provider_template_name
+        template.language_code = language
+        template.billing_category = billing_category
+        template.billing_mode = billing_mode
+        template.sms_body = sms_body
+        template.provider_route = sms_route
+        if args.description is not None:
+            template.description = args.description
+        if parameter_schema is not None:
+            template.parameter_schema = parameter_schema
+    print(f"Updated template mapping: {args.application}/{args.key}/{args.channel}")
 
 
 async def list_templates(args: argparse.Namespace) -> None:
@@ -188,14 +358,18 @@ async def list_templates(args: argparse.Namespace) -> None:
                 )
             ).all()
         )
-    print("id\tkey\tchannel\tcategory\tprovider\tprovider_name\tlanguage\tstatus\tparameters")
+    print(
+        "id\tkey\tchannel\tcategory\tbilling_mode\tprovider\tprovider_name\t"
+        "language\troute\tstatus\tparameters"
+    )
     for template in templates:
-        names = validate_parameter_schema(template.parameter_schema)["body"]
+        names = semantic_parameter_names(template.parameter_schema)
         print(
             f"{template.id}\t{template.template_key}\t{template.channel}\t"
-            f"{template.billing_category or '-'}\t{template.provider}\t"
+            f"{template.billing_category or '-'}\t{template.billing_mode}\t{template.provider}\t"
             f"{template.provider_template_name}\t"
-            f"{template.language_code}\t{template.status}\t{','.join(names) or '-'}"
+            f"{template.language_code or '-'}\t{getattr(template, 'provider_route', None) or '-'}\t"
+            f"{template.status}\t{','.join(names) or '-'}"
         )
 
 
@@ -426,6 +600,27 @@ async def list_pricing_rules(args: argparse.Namespace) -> None:
         )
 
 
+async def advanta_balance(args: argparse.Namespace) -> None:
+    settings = get_settings()
+    if (
+        not settings.advanta_base_url
+        or not settings.advanta_api_key
+        or not settings.advanta_partner_id
+    ):
+        raise SystemExit("Advanta provider is not configured")
+    client = AdvantaClient(
+        base_url=settings.advanta_base_url,
+        api_key=settings.advanta_api_key,
+        partner_id=settings.advanta_partner_id,
+        sender_id=settings.advanta_sender_id,
+    )
+    try:
+        result = await client.get_balance()
+    except AdvantaAPIError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(f"Advanta SMS credit balance: {result.display_credit}")
+
+
 async def disable_pricing_rule(args: argparse.Namespace) -> None:
     async with async_session_factory() as session, session.begin():
         application = await _application(session, args.application)
@@ -484,20 +679,34 @@ async def list_uncertain_messages(args: argparse.Namespace) -> None:
     )
     async with async_session_factory() as session:
         application = await _application(session, args.application)
-        rows = await ReconciliationService().list_stale(
-            session,
-            application.id,
-            older_than=threshold,
-            limit=args.limit,
-            offset=args.offset,
+        service = ReconciliationService()
+        if args.stale_only:
+            rows = await service.list_stale(
+                session,
+                application.id,
+                older_than=threshold,
+                limit=args.limit,
+                offset=args.offset,
+            )
+        else:
+            rows = await service.list_uncertain(
+                session, application.id, limit=args.limit, offset=args.offset
+            )
+    if args.stale_only:
+        print(
+            "filter=stale-only\t"
+            f"threshold_minutes={settings.billing_uncertain_reconcile_after_minutes}\t"
+            f"cutoff={threshold.isoformat()}"
         )
     print(
         "message_id\tbilling_account\tstatus\tamount_minor\tcurrency\tcreated_at\tprovider_id\treconciliation"
     )
     for message, reservation, account in rows:
         print(
-            f"{message.id}\t{account.external_id}\t{message.status}\t"
-            f"{reservation.amount_minor}\t{reservation.currency}\t{reservation.created_at}\t"
+            f"{message.id}\t{account.external_id if account else '-'}\t{message.status}\t"
+            f"{reservation.amount_minor if reservation else 0}\t"
+            f"{reservation.currency if reservation else '-'}\t"
+            f"{reservation.created_at if reservation else message.created_at}\t"
             f"{message.provider_message_id or '-'}\t{message.reconciliation_status or '-'}"
         )
 
@@ -508,13 +717,16 @@ async def show_uncertain_message(args: argparse.Namespace) -> None:
         row = (
             await session.execute(
                 select(OutboundMessage, BillingReservation, BillingAccount)
-                .join(
+                .outerjoin(
                     BillingReservation, BillingReservation.outbound_message_id == OutboundMessage.id
                 )
-                .join(BillingAccount, BillingAccount.id == BillingReservation.billing_account_id)
+                .outerjoin(
+                    BillingAccount, BillingAccount.id == BillingReservation.billing_account_id
+                )
                 .where(
                     OutboundMessage.id == UUID(args.message_id),
                     OutboundMessage.application_id == application.id,
+                    OutboundMessage.status == "uncertain",
                 )
             )
         ).one_or_none()
@@ -535,10 +747,12 @@ async def show_uncertain_message(args: argparse.Namespace) -> None:
         )
     print(
         f"message_id={message.id}\napplication={args.application}\n"
-        f"billing_account={account.external_id}\nstatus={message.status}\n"
+        f"billing_account={account.external_id if account else '-'}\nstatus={message.status}\n"
         f"reconciliation_status={message.reconciliation_status or '-'}\n"
-        f"reservation_status={reservation.status}\namount_minor={reservation.amount_minor}\n"
-        f"currency={reservation.currency}\ncreated_at={reservation.created_at}\n"
+        f"reservation_status={reservation.status if reservation else '-'}\n"
+        f"amount_minor={reservation.amount_minor if reservation else 0}\n"
+        f"currency={reservation.currency if reservation else '-'}\n"
+        f"created_at={reservation.created_at if reservation else message.created_at}\n"
         f"provider_message_id={message.provider_message_id or '-'}\n"
         f"billing_exception={exception.status if exception else '-'}"
     )
@@ -715,6 +929,15 @@ def parser() -> argparse.ArgumentParser:
     application.add_argument("--slug", required=True)
     application.add_argument("--description")
     application.set_defaults(handler=create_application)
+    application_list = commands.add_parser("list-applications")
+    application_list.set_defaults(handler=list_applications)
+    application_show = commands.add_parser("show-application")
+    application_show.add_argument("--application", required=True)
+    application_show.set_defaults(handler=show_application)
+    for name in ("require-application-billing", "allow-application-unbilled"):
+        billing_policy = commands.add_parser(name)
+        billing_policy.add_argument("--application", required=True)
+        billing_policy.set_defaults(handler=set_application_billing_policy)
 
     key = commands.add_parser("create-api-key")
     key.add_argument("--application", required=True)
@@ -731,16 +954,35 @@ def parser() -> argparse.ArgumentParser:
     template = commands.add_parser("create-template")
     template.add_argument("--application", required=True)
     template.add_argument("--key", required=True)
-    template.add_argument("--channel", default="whatsapp")
+    template.add_argument("--channel", choices=("whatsapp", "sms"), default="whatsapp")
     template.add_argument("--provider", default="meta")
-    template.add_argument("--provider-template-name", required=True)
-    template.add_argument("--language", required=True)
+    template.add_argument("--provider-template-name")
+    template.add_argument("--language")
+    template.add_argument("--sms-body")
+    template.add_argument("--sms-route", choices=("standard", "transactional"))
     template.add_argument("--description")
     template.add_argument("--parameter-schema", default='{"body": []}')
     template.add_argument(
         "--billing-category", choices=("utility", "authentication", "marketing"), required=True
     )
+    template.add_argument("--billing-mode", choices=("customer", "platform"), default="customer")
     template.set_defaults(handler=create_template)
+    template_update = commands.add_parser("update-template")
+    template_update.add_argument("--application", required=True)
+    template_update.add_argument("--key", required=True)
+    template_update.add_argument("--channel", default="whatsapp", choices=("whatsapp", "sms"))
+    template_update.add_argument("--provider", choices=("meta", "advanta"))
+    template_update.add_argument("--provider-template-name")
+    template_update.add_argument("--language")
+    template_update.add_argument("--sms-body")
+    template_update.add_argument("--sms-route", choices=("standard", "transactional"))
+    template_update.add_argument("--description")
+    template_update.add_argument("--parameter-schema")
+    template_update.add_argument(
+        "--billing-category", choices=("utility", "authentication", "marketing")
+    )
+    template_update.add_argument("--billing-mode", choices=("customer", "platform"))
+    template_update.set_defaults(handler=update_template)
     template_list = commands.add_parser("list-templates")
     template_list.add_argument("--application", required=True)
     template_list.set_defaults(handler=list_templates)
@@ -787,7 +1029,7 @@ def parser() -> argparse.ArgumentParser:
     transactions.set_defaults(handler=list_wallet_transactions)
     pricing_create = commands.add_parser("create-pricing-rule")
     pricing_create.add_argument("--application", required=True)
-    pricing_create.add_argument("--channel", choices=("whatsapp",), default="whatsapp")
+    pricing_create.add_argument("--channel", choices=("whatsapp", "sms"), default="whatsapp")
     pricing_create.add_argument("--message-kind", choices=("text", "template"), required=True)
     pricing_create.add_argument(
         "--billing-category", choices=("utility", "authentication", "marketing")
@@ -804,6 +1046,8 @@ def parser() -> argparse.ArgumentParser:
     pricing_disable.add_argument("--application", required=True)
     pricing_disable.add_argument("--rule-id", required=True)
     pricing_disable.set_defaults(handler=disable_pricing_rule)
+    provider_balance = commands.add_parser("advanta-balance")
+    provider_balance.set_defaults(handler=advanta_balance)
     summary = commands.add_parser("monthly-usage-summary")
     summary.add_argument("--application", required=True)
     summary.add_argument("--external-id", required=True)
@@ -813,6 +1057,7 @@ def parser() -> argparse.ArgumentParser:
     uncertain_list.add_argument("--application", required=True)
     uncertain_list.add_argument("--limit", type=int, choices=range(1, 101), default=50)
     uncertain_list.add_argument("--offset", type=int, default=0)
+    uncertain_list.add_argument("--stale-only", action="store_true")
     uncertain_list.set_defaults(handler=list_uncertain_messages)
     uncertain_show = commands.add_parser("show-uncertain-message")
     uncertain_show.add_argument("--application", required=True)

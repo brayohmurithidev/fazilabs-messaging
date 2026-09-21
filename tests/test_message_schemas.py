@@ -49,7 +49,7 @@ def test_template_request_normalizes_phone_and_limits_values() -> None:
 def test_template_request_rejects_invalid_key_channel_and_metadata() -> None:
     for changes in (
         {"template": "Invalid Template"},
-        {"channel": "sms"},
+        {"channel": "email"},
         {"metadata": {"large": "x" * 9000}},
     ):
         values = {

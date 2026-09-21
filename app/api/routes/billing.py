@@ -10,7 +10,7 @@ from app.db.session import get_db_session
 from app.models.billing import BillingAccount, MessageUsage
 from app.schemas.billing import BalanceResponse, UsageItem, UsageResponse
 
-router = APIRouter(prefix="/api/v1/billing-accounts", tags=["billing"])
+router = APIRouter(prefix="/api/v1/billing-accounts", tags=["Billing"])
 
 
 def format_minor(amount: int) -> str:
@@ -31,7 +31,21 @@ async def _account(session: AsyncSession, application_id, external_id: str) -> B
     return account
 
 
-@router.get("/{external_id}/balance", response_model=BalanceResponse)
+@router.get(
+    "/{external_id}/balance",
+    response_model=BalanceResponse,
+    summary="Get a billing account balance",
+    description=(
+        "Returns the prepaid balance, active reservation total, and currently available amount "
+        "for an account owned by the authenticated application. Monetary `*_minor` values use "
+        "the currency's minor unit. Wallet mutation remains operator-only."
+    ),
+    response_description="Current prepaid wallet balance and reservations.",
+    responses={
+        401: {"description": "Missing or invalid application API key."},
+        404: {"description": "Billing account not found for this application."},
+    },
+)
 async def get_balance(
     external_id: str,
     application: AuthenticatedApplication,
@@ -48,7 +62,21 @@ async def get_balance(
     )
 
 
-@router.get("/{external_id}/usage", response_model=UsageResponse)
+@router.get(
+    "/{external_id}/usage",
+    response_model=UsageResponse,
+    summary="List billing account usage",
+    description=(
+        "Lists immutable accepted-message usage attributed to an application-owned billing "
+        "account. The recorded billing mode distinguishes customer-funded from platform-funded "
+        "usage. For SMS, `sms_page_count` records accepted billable pages."
+    ),
+    response_description="Paginated usage and customer-charge totals for the selected filters.",
+    responses={
+        401: {"description": "Missing or invalid application API key."},
+        404: {"description": "Billing account not found for this application."},
+    },
+)
 async def get_usage(
     external_id: str,
     application: AuthenticatedApplication,
@@ -100,6 +128,8 @@ async def get_usage(
                 channel=item.channel,
                 message_kind=item.message_kind,
                 billing_category=item.billing_category,
+                billing_mode=item.billing_mode,
+                sms_page_count=item.sms_page_count,
                 currency=item.currency,
                 customer_price_minor=item.customer_price_minor,
                 created_at=item.created_at,

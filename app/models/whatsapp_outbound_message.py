@@ -3,7 +3,16 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -26,9 +35,21 @@ class OutboundMessage(Base):
             "status IN ('pending', 'sent', 'delivered', 'read', 'failed', 'uncertain')",
             name="outbound_message_status",
         ),
-        CheckConstraint("channel IN ('whatsapp')", name="outbound_message_channel"),
+        CheckConstraint("channel IN ('whatsapp', 'sms')", name="outbound_message_channel"),
         CheckConstraint("message_kind IN ('text', 'template')", name="outbound_message_kind"),
+        CheckConstraint(
+            "billing_mode IN ('customer', 'platform')", name="outbound_message_billing_mode"
+        ),
+        CheckConstraint(
+            "(channel = 'whatsapp' AND sms_character_count IS NULL "
+            "AND sms_page_count IS NULL AND provider_route IS NULL) OR "
+            "(channel = 'sms' AND sms_character_count BETWEEN 1 AND 960 "
+            "AND sms_page_count BETWEEN 1 AND 6 "
+            "AND provider_route IN ('standard', 'transactional'))",
+            name="outbound_message_sms_pages",
+        ),
         UniqueConstraint("application_id", "idempotency_key", name="uq_outbound_app_idempotency"),
+        UniqueConstraint("provider", "provider_message_id", name="uq_outbound_provider_message"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -56,9 +77,16 @@ class OutboundMessage(Base):
     template_parameters: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     provider_template_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     template_language_code: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    provider_route: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    sms_character_count: Mapped[int | None] = mapped_column(nullable=True)
+    sms_page_count: Mapped[int | None] = mapped_column(nullable=True)
+    provider_cost_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     billing_category: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    billing_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="customer", server_default="customer"
+    )
     provider: Mapped[str] = mapped_column(String(64), nullable=False, default="meta")
-    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     status: Mapped[str] = mapped_column(
         String(16), nullable=False, default=OutboundMessageStatus.PENDING
     )

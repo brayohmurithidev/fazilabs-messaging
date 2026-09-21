@@ -169,9 +169,15 @@ class WhatsAppWebhookService:
             ):
                 continue
             timestamp = self._timestamp(event.get("timestamp"))
-            if getattr(message, "billing_account_id", None) is not None and (
+            if (
                 message.status == "uncertain"
-                or getattr(message, "reconciliation_status", None) == "released"
+                and getattr(message, "billing_mode", "customer") == "platform"
+            ) or (
+                getattr(message, "billing_account_id", None) is not None
+                and (
+                    message.status == "uncertain"
+                    or getattr(message, "reconciliation_status", None) == "released"
+                )
             ):
                 await self.reconciliation_service.accept_webhook_locked(
                     session,
@@ -196,7 +202,9 @@ class WhatsAppWebhookService:
             else:
                 message.status = incoming
                 setattr(message, f"{incoming}_at", timestamp)
-                if getattr(message, "billing_account_id", None) is not None and getattr(
+                if getattr(message, "billing_mode", "customer") == "platform":
+                    await self.billing_service.record_platform_usage(session, message)
+                elif getattr(message, "billing_account_id", None) is not None and getattr(
                     message, "reconciliation_status", None
                 ) not in {"released", "billing_exception"}:
                     await self.billing_service.charge(session, message, timestamp)

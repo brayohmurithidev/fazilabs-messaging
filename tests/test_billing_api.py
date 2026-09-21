@@ -83,6 +83,8 @@ async def test_usage_endpoint_is_bounded_and_aggregated(app) -> None:
         channel="whatsapp",
         message_kind="template",
         billing_category="utility",
+        billing_mode="customer",
+        sms_page_count=None,
         currency="KES",
         customer_price_minor=125,
         created_at=datetime.now(UTC),

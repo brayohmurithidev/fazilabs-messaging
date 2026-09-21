@@ -1,4 +1,6 @@
 import argparse
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
@@ -10,6 +12,7 @@ from app.schemas.messages import TemplateMessageRequest
 from app.services.billing import (
     BillingAccountNotFoundError,
     BillingAccountSuspendedError,
+    BillingService,
     InsufficientBalanceError,
     PricingRuleNotFoundError,
     major_to_minor,
@@ -92,3 +95,58 @@ def test_billing_cli_commands_are_registered() -> None:
 
 def test_idempotency_conflict_remains_a_distinct_domain_error() -> None:
     assert not isinstance(IdempotencyConflictError(), PricingRuleNotFoundError)
+
+
+class PlatformUsageSession:
+    def __init__(self):
+        self.added = []
+
+    async def scalar(self, statement):
+        return None
+
+    def add(self, value):
+        self.added.append(value)
+
+
+@pytest.mark.asyncio
+async def test_platform_usage_records_responsibility_without_invented_cost_or_charge() -> None:
+    session = PlatformUsageSession()
+    message = SimpleNamespace(
+        id=uuid4(),
+        application_id=uuid4(),
+        billing_account_id=None,
+        channel="whatsapp",
+        message_kind="template",
+        billing_category="authentication",
+        provider="meta",
+    )
+    usage = await BillingService().record_platform_usage(session, message)
+
+    assert usage.billing_mode == "platform"
+    assert usage.billing_account_id is None
+    assert usage.pricing_rule_id is None
+    assert usage.currency is None
+    assert usage.provider_cost_minor is None
+    assert usage.customer_price_minor == 0
+    assert usage.billing_status == "platform_funded"
+    assert session.added == [usage]
+
+
+@pytest.mark.asyncio
+async def test_platform_sms_usage_snapshots_pages_and_provider_cost() -> None:
+    session = PlatformUsageSession()
+    message = SimpleNamespace(
+        id=uuid4(),
+        application_id=uuid4(),
+        billing_account_id=None,
+        channel="sms",
+        message_kind="template",
+        billing_category="utility",
+        provider="advanta",
+        sms_page_count=3,
+        provider_cost_minor=60,
+    )
+    usage = await BillingService().record_platform_usage(session, message)
+    assert usage.sms_page_count == 3
+    assert usage.provider_cost_minor == 60
+    assert usage.customer_price_minor == 0

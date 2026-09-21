@@ -2,7 +2,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.billing import BillingAccount, BillingReservation
@@ -33,6 +33,22 @@ class ReconciliationService:
     def __init__(self, billing_service: BillingService | None = None) -> None:
         self.billing_service = billing_service or BillingService()
 
+    async def list_uncertain(
+        self,
+        session: AsyncSession,
+        application_id: UUID,
+        *,
+        limit: int,
+        offset: int,
+    ) -> list[tuple[OutboundMessage, BillingReservation | None, BillingAccount | None]]:
+        return list(
+            (
+                await session.execute(
+                    self._uncertain_query(application_id).limit(limit).offset(offset)
+                )
+            ).tuples()
+        )
+
     async def list_stale(
         self,
         session: AsyncSession,
@@ -41,29 +57,38 @@ class ReconciliationService:
         older_than: datetime,
         limit: int,
         offset: int,
-    ) -> list[tuple[OutboundMessage, BillingReservation, BillingAccount]]:
+    ) -> list[tuple[OutboundMessage, BillingReservation | None, BillingAccount | None]]:
         return list(
             (
                 await session.execute(
-                    select(OutboundMessage, BillingReservation, BillingAccount)
-                    .join(
-                        BillingReservation,
-                        BillingReservation.outbound_message_id == OutboundMessage.id,
-                    )
-                    .join(
-                        BillingAccount, BillingAccount.id == BillingReservation.billing_account_id
-                    )
+                    self._uncertain_query(application_id)
                     .where(
-                        OutboundMessage.application_id == application_id,
-                        OutboundMessage.status == "uncertain",
-                        BillingReservation.status == "active",
-                        BillingReservation.created_at <= older_than,
+                        OutboundMessage.created_at <= older_than,
+                        or_(
+                            OutboundMessage.billing_mode == "platform",
+                            BillingReservation.status == "active",
+                        ),
                     )
-                    .order_by(BillingReservation.created_at)
                     .limit(limit)
                     .offset(offset)
                 )
             ).tuples()
+        )
+
+    @staticmethod
+    def _uncertain_query(application_id: UUID):
+        return (
+            select(OutboundMessage, BillingReservation, BillingAccount)
+            .outerjoin(
+                BillingReservation,
+                BillingReservation.outbound_message_id == OutboundMessage.id,
+            )
+            .outerjoin(BillingAccount, BillingAccount.id == BillingReservation.billing_account_id)
+            .where(
+                OutboundMessage.application_id == application_id,
+                OutboundMessage.status == "uncertain",
+            )
+            .order_by(OutboundMessage.created_at)
         )
 
     async def reconcile(
@@ -187,10 +212,27 @@ class ReconciliationService:
             raise InvalidReconciliationTransitionError
         if message.status == "failed" and message.reconciliation_status != "released":
             raise InvalidReconciliationTransitionError
-        reservation = await self._lock_reservation(session, message.id)
         message.provider_message_id = provider_message_id
         message.status = "sent"
         message.sent_at = timestamp
+        if getattr(message, "billing_mode", "customer") == "platform":
+            await self.billing_service.record_platform_usage(session, message)
+            message.reconciliation_status = "resolved_accepted"
+            self._audit(
+                session,
+                message.id,
+                "resolved_accepted",
+                reason,
+                provider_message_id,
+                timestamp,
+                method,
+            )
+            logger.info(
+                "reconciliation_resolved_accepted",
+                extra={"outbound_message_id": str(message.id)},
+            )
+            return
+        reservation = await self._lock_reservation(session, message.id)
         charged = await self.billing_service.charge(
             session, message, timestamp, allow_released=reservation.status == "released"
         )

@@ -181,6 +181,72 @@ async def counts(sessions, account_id, message_id):
         return account, usage, debits
 
 
+async def test_uncertain_listing_default_stale_filter_and_application_isolation() -> None:
+    engine, sessions = await database_sessions()
+    application_id, account_id, old_message_id = await create_uncertain(
+        sessions, balance=300, amount=60
+    )
+    other_application_id = None
+    try:
+        recent_message_id = uuid4()
+        now = datetime.now(UTC)
+        async with sessions.begin() as session:
+            old_message = await session.get(OutboundMessage, old_message_id)
+            account = await session.get(BillingAccount, account_id)
+            rule = await session.scalar(
+                select(PricingRule).where(PricingRule.application_id == application_id)
+            )
+            old_message.created_at = now - timedelta(days=2)
+            account.reserved_minor += 60
+            session.add(
+                OutboundMessage(
+                    id=recent_message_id,
+                    application_id=application_id,
+                    billing_account_id=account_id,
+                    channel="whatsapp",
+                    recipient="254700000001",
+                    message_kind="text",
+                    text_body="test-only",
+                    provider="meta",
+                    status="uncertain",
+                    idempotency_key=f"recent-{uuid4().hex}",
+                    payload_hash="1" * 64,
+                    created_at=now,
+                )
+            )
+            await session.flush()
+            session.add(
+                BillingReservation(
+                    billing_account_id=account_id,
+                    outbound_message_id=recent_message_id,
+                    pricing_rule_id=rule.id,
+                    amount_minor=60,
+                    currency="KES",
+                    created_at=now,
+                )
+            )
+
+        other_application_id, _, other_message_id = await create_uncertain(sessions)
+        async with sessions() as session:
+            service = ReconciliationService()
+            all_rows = await service.list_uncertain(session, application_id, limit=50, offset=0)
+            stale_rows = await service.list_stale(
+                session,
+                application_id,
+                older_than=now - timedelta(days=1),
+                limit=50,
+                offset=0,
+            )
+        assert [row[0].id for row in all_rows] == [old_message_id, recent_message_id]
+        assert [row[0].id for row in stale_rows] == [old_message_id]
+        assert other_message_id not in {row[0].id for row in all_rows}
+    finally:
+        await cleanup(sessions, application_id)
+        if other_application_id is not None:
+            await cleanup(sessions, other_application_id)
+        await engine.dispose()
+
+
 async def test_two_acceptance_reconciliations_charge_once() -> None:
     engine, sessions = await database_sessions()
     application_id, account_id, message_id = await create_uncertain(sessions)

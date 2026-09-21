@@ -6,6 +6,7 @@ import httpx
 from pydantic import SecretStr
 
 from app.schemas.whatsapp import WhatsAppSendResult
+from app.services.template_parameters import UrlButtonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,7 @@ class WhatsAppCloudAPIClient:
         provider_template_name: str,
         language_code: str,
         body_parameters: list[str],
+        url_button_parameters: list[UrlButtonValue] | None = None,
     ) -> WhatsAppSendResult:
         components: list[dict[str, Any]] = []
         if body_parameters:
@@ -94,6 +96,15 @@ class WhatsAppCloudAPIClient:
                     "parameters": [
                         {"type": "text", "text": parameter} for parameter in body_parameters
                     ],
+                }
+            )
+        for button in url_button_parameters or []:
+            components.append(
+                {
+                    "type": "button",
+                    "sub_type": "url",
+                    "index": str(button.index),
+                    "parameters": [{"type": "text", "text": button.value}],
                 }
             )
         payload: dict[str, Any] = {
@@ -106,9 +117,19 @@ class WhatsAppCloudAPIClient:
                 "components": components,
             },
         }
-        return await self._send(payload, recipient=to)
+        return await self._send(
+            payload,
+            recipient=to,
+            sensitive_values=[button.value for button in url_button_parameters or []],
+        )
 
-    async def _send(self, payload: dict[str, Any], *, recipient: str) -> WhatsAppSendResult:
+    async def _send(
+        self,
+        payload: dict[str, Any],
+        *,
+        recipient: str,
+        sensitive_values: list[str] | None = None,
+    ) -> WhatsAppSendResult:
         headers = {
             "Authorization": f"Bearer {self._access_token.get_secret_value()}",
             "Content-Type": "application/json",
@@ -121,27 +142,49 @@ class WhatsAppCloudAPIClient:
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     response = await client.post(self._messages_url, headers=headers, json=payload)
-        except httpx.TimeoutException as exc:
+        except (httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API connection could not be established", ambiguous_delivery=False
+            ) from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
             raise WhatsAppTimeoutError(
                 "WhatsApp API request timed out", ambiguous_delivery=True
             ) from exc
+        except httpx.ConnectError as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API connection could not be established", ambiguous_delivery=False
+            ) from exc
+        except httpx.LocalProtocolError as exc:
+            raise WhatsAppNetworkError(
+                "WhatsApp API request was rejected locally", ambiguous_delivery=False
+            ) from exc
         except httpx.RequestError as exc:
-            raise WhatsAppNetworkError("WhatsApp API network request failed") from exc
+            raise WhatsAppNetworkError(
+                "WhatsApp API network request outcome is unknown", ambiguous_delivery=True
+            ) from exc
 
         if not response.is_success:
-            self._raise_response_error(response)
+            self._raise_response_error(response, sensitive_values=sensitive_values or [])
         return self._parse_success(response, recipient=recipient)
 
-    def _raise_response_error(self, response: httpx.Response) -> None:
-        details = self._safe_error_details(response)
+    def _raise_response_error(
+        self, response: httpx.Response, *, sensitive_values: list[str]
+    ) -> None:
+        details = self._safe_error_details(response, sensitive_values=sensitive_values)
         error_class = (
             WhatsAppClientResponseError
             if 400 <= response.status_code < 500
             else WhatsAppServerResponseError
         )
-        raise error_class(status_code=response.status_code, **details)
+        raise error_class(
+            status_code=response.status_code,
+            ambiguous_delivery=response.status_code >= 500,
+            **details,
+        )
 
-    def _safe_error_details(self, response: httpx.Response) -> dict[str, str | None]:
+    def _safe_error_details(
+        self, response: httpx.Response, *, sensitive_values: list[str]
+    ) -> dict[str, str | None]:
         error: dict[str, Any] = {}
         try:
             body = response.json()
@@ -153,7 +196,8 @@ class WhatsAppCloudAPIClient:
         message = error.get("message") if isinstance(error.get("message"), str) else None
         return {
             "message": self._sanitize(
-                message or f"WhatsApp API returned HTTP {response.status_code}"
+                message or f"WhatsApp API returned HTTP {response.status_code}",
+                sensitive_values=sensitive_values,
             ),
             "error_code": self._string_or_none(error.get("code")),
             "error_subcode": self._string_or_none(error.get("error_subcode")),
@@ -182,15 +226,23 @@ class WhatsAppCloudAPIClient:
             if messages and isinstance(messages[0].get("id"), str):
                 meta_message_id = messages[0]["id"]
 
+        if not meta_message_id:
+            raise WhatsAppMalformedResponseError(
+                "WhatsApp API success response omitted message ID", ambiguous_delivery=True
+            )
+
         return WhatsAppSendResult(
             recipient=recipient,
             meta_message_id=meta_message_id,
             success=True,
         )
 
-    def _sanitize(self, message: str) -> str:
+    def _sanitize(self, message: str, *, sensitive_values: list[str] | None = None) -> str:
         token = self._access_token.get_secret_value()
-        return message.replace(token, "[redacted]")[:1000]
+        sanitized = message.replace(token, "[redacted]")
+        for value in sensitive_values or []:
+            sanitized = sanitized.replace(value, "[redacted]")
+        return sanitized[:1000]
 
     @staticmethod
     def _string_or_none(value: Any) -> str | None:
