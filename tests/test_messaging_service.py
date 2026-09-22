@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from uuid import uuid4
@@ -56,19 +57,53 @@ class Repository:
             sms_character_count=values.get("sms_character_count"),
             sms_page_count=values.get("sms_page_count"),
             provider_cost_minor=values.get("provider_cost_minor"),
+            claimed_by=None,
         )
         return self.message, True
 
-    async def mark_sent(self, session, message_id, provider_message_id, timestamp):
+    async def claim(self, session, message_id, *, claimed_by, lease_seconds):
+        if (
+            self.message is None
+            or self.message.id != message_id
+            or self.message.status != "pending"
+        ):
+            return None
+        self.message.status = "submitting"
+        self.message.claimed_by = claimed_by
+        return self.message
+
+    async def mark_sent(
+        self,
+        session,
+        message_id,
+        provider_message_id,
+        timestamp,
+        *,
+        expected_status="submitting",
+    ):
+        if self.message.status != expected_status:
+            return None
         self.message.status = "sent"
         self.message.provider_message_id = provider_message_id
+        return self.message
 
     async def mark_error(
-        self, session, message_id, *, status, error_code, error_message, timestamp
+        self,
+        session,
+        message_id,
+        *,
+        status,
+        error_code,
+        error_message,
+        timestamp,
+        expected_status="submitting",
     ):
+        if self.message.status != expected_status:
+            return None
         self.message.status = status
         self.message.error_code = error_code
         self.message.error_message = error_message
+        return self.message
 
 
 class Provider:
@@ -256,6 +291,48 @@ async def test_exact_retry_returns_existing_without_provider_call() -> None:
     )
     assert result is existing
     assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_while_pending_does_not_call_provider() -> None:
+    payload = request()
+    existing = SimpleNamespace(payload_hash=canonical_payload_hash(payload), status="pending")
+    provider = Provider()
+    result = await MessagingService(provider, Repository(existing)).send_text(
+        Session(), SimpleNamespace(id=uuid4()), "test-key-pending-001", payload
+    )
+    assert result is existing
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_replay_while_submitting_does_not_call_provider() -> None:
+    payload = request()
+    existing = SimpleNamespace(payload_hash=canonical_payload_hash(payload), status="submitting")
+    provider = Provider()
+    result = await MessagingService(provider, Repository(existing)).send_text(
+        Session(), SimpleNamespace(id=uuid4()), "test-key-submitting-001", payload
+    )
+    assert result is existing
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_logs_exclude_sensitive_payload_values(caplog) -> None:
+    caplog.set_level(logging.INFO)
+    provider = Provider()
+    secret_text = "super-secret-result-token-abc123"
+    result = await MessagingService(provider, Repository()).send_text(
+        Session(), SimpleNamespace(id=uuid4()), "log-safety-001", request(text=secret_text)
+    )
+    for record in caplog.records:
+        for value in vars(record).values():
+            assert secret_text not in str(value)
+    messages = [record.getMessage() for record in caplog.records]
+    assert "outbound_claimed" in messages
+    assert "outbound_status_transition" in messages
+    outbound_ids = {getattr(record, "outbound_message_id", None) for record in caplog.records}
+    assert str(result.id) in outbound_ids
 
 
 @pytest.mark.asyncio

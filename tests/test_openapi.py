@@ -73,6 +73,19 @@ def test_openapi_contains_no_secret_values(test_settings) -> None:
     assert "fzmsg_" not in serialized
 
 
+def test_openapi_message_status_includes_submitting(test_settings) -> None:
+    schema = create_app(test_settings).openapi()
+    assert schema["components"]["schemas"]["MessageStatus"]["enum"] == [
+        "pending",
+        "submitting",
+        "sent",
+        "delivered",
+        "read",
+        "failed",
+        "uncertain",
+    ]
+
+
 def test_openapi_documents_database_readiness(test_settings) -> None:
     operation = create_app(test_settings).openapi()["paths"]["/ready"]["get"]
 
