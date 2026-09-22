@@ -113,6 +113,7 @@ def get_messaging_service(request: Request) -> MessagingService:
         whatsapp,
         advanta_client=advanta,
         advanta_provider_cost_per_page_minor=settings.advanta_provider_cost_per_page_minor,
+        claim_lease_seconds=settings.dispatch_claim_lease_seconds,
     )
 
 
@@ -291,8 +292,10 @@ async def send_template_message(
     summary="Get a message",
     description=(
         "Gets one message owned by the authenticated application. Statuses are `pending`, "
-        "`sent`, `delivered`, `read`, `failed`, or `uncertain`. `uncertain` means provider "
-        "acceptance could not safely be determined and Messaging will not blindly resend."
+        "`submitting`, `sent`, `delivered`, `read`, `failed`, or `uncertain`. `submitting` "
+        "means a provider submission may be in flight or its outcome is not yet durably "
+        "known; `uncertain` means provider acceptance could not safely be determined. "
+        "Messaging will not blindly resend a `submitting` or `uncertain` message."
     ),
     response_description="The application-owned message and its current lifecycle status.",
     responses={

@@ -15,6 +15,7 @@ class Channel(StrEnum):
 
 class MessageStatus(StrEnum):
     PENDING = "pending"
+    SUBMITTING = "submitting"
     SENT = "sent"
     DELIVERED = "delivered"
     READ = "read"

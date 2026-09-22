@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     advanta_sender_id: str = "FAZILABS"
     advanta_provider_cost_per_page_minor: int | None = Field(default=None, ge=0)
     billing_uncertain_reconcile_after_minutes: int = Field(default=1440, ge=1)
+    dispatch_claim_lease_seconds: int = Field(default=90, ge=1)
+    dispatch_pending_grace_seconds: int = Field(default=60, ge=1)
+    dispatch_sweep_batch_size: int = Field(default=25, ge=1)
 
     @model_validator(mode="after")
     def validate_environment(self) -> "Settings":
