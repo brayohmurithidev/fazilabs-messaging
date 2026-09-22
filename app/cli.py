@@ -4,7 +4,7 @@ import json
 import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from alembic.config import Config
@@ -40,6 +40,8 @@ from app.services.billing_exceptions import (
     BillingExceptionService,
     InvalidBillingExceptionError,
 )
+from app.services.dispatch_sweeper import DispatchSweeper
+from app.services.messaging import MessagingService
 from app.services.reconciliation import (
     InvalidReconciliationTransitionError,
     ProviderMessageIdRequiredError,
@@ -53,6 +55,7 @@ from app.services.template_parameters import (
     semantic_parameter_names,
     validate_parameter_schema,
 )
+from app.services.whatsapp_client import WhatsAppCloudAPIClient
 
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEMPLATE_KEY_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
@@ -883,6 +886,59 @@ async def resolve_billing_exception(args: argparse.Namespace) -> None:
     print(f"Billing exception resolved: {exception.id} {exception.status}")
 
 
+def _messaging_service_from_settings(settings, *, claim_identity: str) -> MessagingService:
+    whatsapp = None
+    if all(
+        (
+            settings.whatsapp_api_version,
+            settings.whatsapp_phone_number_id,
+            settings.whatsapp_access_token,
+        )
+    ):
+        whatsapp = WhatsAppCloudAPIClient(
+            api_version=settings.whatsapp_api_version,
+            phone_number_id=settings.whatsapp_phone_number_id,
+            access_token=settings.whatsapp_access_token,
+        )
+    advanta = None
+    if settings.advanta_base_url and settings.advanta_api_key and settings.advanta_partner_id:
+        advanta = AdvantaClient(
+            base_url=settings.advanta_base_url,
+            api_key=settings.advanta_api_key,
+            partner_id=settings.advanta_partner_id,
+            sender_id=settings.advanta_sender_id,
+        )
+    return MessagingService(
+        whatsapp,
+        advanta_client=advanta,
+        advanta_provider_cost_per_page_minor=settings.advanta_provider_cost_per_page_minor,
+        claim_identity=claim_identity,
+        claim_lease_seconds=settings.dispatch_claim_lease_seconds,
+    )
+
+
+async def dispatch_sweep(args: argparse.Namespace) -> None:
+    """Run one recovery pass: dispatch abandoned `pending` rows, and move
+    lease-expired `submitting` rows to `uncertain`. Intended to be invoked
+    repeatedly by an external scheduler (cron/systemd timer); it performs a
+    single bounded pass and exits rather than looping itself.
+    """
+    settings = get_settings()
+    sweeper_id = f"sweeper-cli:{uuid4().hex[:12]}"
+    messaging_service = _messaging_service_from_settings(settings, claim_identity=sweeper_id)
+    sweeper = DispatchSweeper(
+        messaging_service,
+        sweeper_id=sweeper_id,
+        pending_grace_seconds=settings.dispatch_pending_grace_seconds,
+        claim_lease_seconds=settings.dispatch_claim_lease_seconds,
+        batch_size=settings.dispatch_sweep_batch_size,
+    )
+    async with async_session_factory() as session:
+        result = await sweeper.sweep_once(session)
+    print(f"Dispatched from abandoned pending: {result.dispatched_from_pending}")
+    print(f"Expired submitting -> uncertain: {result.expired_submitting_to_uncertain}")
+
+
 async def doctor(args: argparse.Namespace) -> None:
     settings = get_settings()
     checks: list[tuple[str, str]] = []
@@ -1098,6 +1154,16 @@ def parser() -> argparse.ArgumentParser:
     diagnostics = commands.add_parser("doctor")
     diagnostics.add_argument("--check-reachability", action="store_true")
     diagnostics.set_defaults(handler=doctor)
+
+    sweep = commands.add_parser(
+        "dispatch-sweep",
+        help=(
+            "Run one delivery-recovery pass: dispatch abandoned pending "
+            "messages and move lease-expired submitting messages to "
+            "uncertain. Schedule externally (cron/systemd timer)."
+        ),
+    )
+    sweep.set_defaults(handler=dispatch_sweep)
     return result
 
 
