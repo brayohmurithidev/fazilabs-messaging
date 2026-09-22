@@ -8,10 +8,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -21,6 +23,7 @@ from app.db.base import Base
 
 class OutboundMessageStatus(StrEnum):
     PENDING = "pending"
+    SUBMITTING = "submitting"
     SENT = "sent"
     DELIVERED = "delivered"
     READ = "read"
@@ -32,7 +35,8 @@ class OutboundMessage(Base):
     __tablename__ = "outbound_messages"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'sent', 'delivered', 'read', 'failed', 'uncertain')",
+            "status IN "
+            "('pending', 'submitting', 'sent', 'delivered', 'read', 'failed', 'uncertain')",
             name="outbound_message_status",
         ),
         CheckConstraint("channel IN ('whatsapp', 'sms')", name="outbound_message_channel"),
@@ -50,6 +54,16 @@ class OutboundMessage(Base):
         ),
         UniqueConstraint("application_id", "idempotency_key", name="uq_outbound_app_idempotency"),
         UniqueConstraint("provider", "provider_message_id", name="uq_outbound_provider_message"),
+        Index(
+            "ix_outbound_messages_pending_created_at",
+            "created_at",
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_outbound_messages_submitting_lease_expiry",
+            "claim_lease_expires_at",
+            postgresql_where=text("status = 'submitting'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -99,6 +113,11 @@ class OutboundMessage(Base):
     )
     idempotency_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
     payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
