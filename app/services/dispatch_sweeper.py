@@ -1,5 +1,6 @@
 import logging
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 class SweepResult:
     dispatched_from_pending: int
     expired_submitting_to_uncertain: int
+    # Resulting status of each dispatched row, e.g. {"sent": 3, "uncertain": 1}.
+    dispatch_outcomes: dict[str, int] = field(default_factory=dict)
 
 
 class DispatchSweeper:
@@ -27,9 +30,10 @@ class DispatchSweeper:
     resolving once a row reaches `uncertain`.
 
     1. Claim and dispatch `pending` rows nobody has claimed within the grace
-       period. These are provably never submitted to a provider -- safe to
-       submit now, exactly once, using the same guarded outcome handling as
-       the synchronous request path.
+       period, one row per claim, each immediately before its own dispatch.
+       These are provably never submitted to a provider -- safe to submit
+       now, exactly once, using the same guarded outcome handling as the
+       synchronous request path.
     2. Move `submitting` rows whose claim lease has expired to `uncertain`.
        A provider submission may have happened; the row is NEVER resubmitted,
        NEVER auto-charged, and NEVER auto-released here.
@@ -53,23 +57,41 @@ class DispatchSweeper:
         self.batch_size = batch_size
 
     async def sweep_once(self, session: AsyncSession) -> SweepResult:
-        dispatched = await self._sweep_abandoned_pending(session)
+        outcomes = await self._sweep_abandoned_pending(session)
         expired = await self._sweep_expired_submitting(session)
         return SweepResult(
-            dispatched_from_pending=dispatched, expired_submitting_to_uncertain=expired
+            dispatched_from_pending=sum(outcomes.values()),
+            expired_submitting_to_uncertain=expired,
+            dispatch_outcomes=dict(outcomes),
         )
 
-    async def _sweep_abandoned_pending(self, session: AsyncSession) -> int:
+    async def _sweep_abandoned_pending(self, session: AsyncSession) -> Counter[str]:
+        """Claim and dispatch up to ``batch_size`` abandoned rows, ONE AT A TIME.
+
+        Each row is claimed in its own transaction immediately before its own
+        dispatch, so its lease starts when its provider attempt is about to
+        begin -- never while it waits behind earlier rows' provider calls.
+        Pre-claiming the whole batch under one lease let a slow batch outlive
+        the lease, and a concurrent sweep then marked not-yet-attempted rows
+        ``uncertain`` shortly before this sweep submitted them anyway.
+        MessagingService additionally re-verifies the claim right before the
+        provider call (``start_attempt``). A crash leaves at most the one
+        in-flight row ``submitting``; unclaimed rows stay ``pending``.
+        """
         older_than = datetime.now(UTC) - timedelta(seconds=self.pending_grace_seconds)
-        async with session.begin():
-            claimed = await self.repository.claim_abandoned_pending(
-                session,
-                older_than=older_than,
-                claimed_by=self.sweeper_id,
-                lease_seconds=self.claim_lease_seconds,
-                limit=self.batch_size,
-            )
-        for message in claimed:
+        outcomes: Counter[str] = Counter()
+        for _ in range(self.batch_size):
+            async with session.begin():
+                claimed = await self.repository.claim_abandoned_pending(
+                    session,
+                    older_than=older_than,
+                    claimed_by=self.sweeper_id,
+                    lease_seconds=self.claim_lease_seconds,
+                    limit=1,
+                )
+            if not claimed:
+                break
+            message = claimed[0]
             logger.info(
                 "outbound_claimed",
                 extra={
@@ -80,12 +102,9 @@ class DispatchSweeper:
                     "channel": message.channel,
                 },
             )
-            # Each dispatch opens and commits its own outcome transaction(s);
-            # a crash partway through this loop leaves the remaining claimed
-            # rows durably `submitting`, to be resolved by the next sweep's
-            # expiry check -- never resubmitted.
-            await self.messaging_service.dispatch_claimed_from_row(session, message)
-        return len(claimed)
+            result = await self.messaging_service.dispatch_claimed_from_row(session, message)
+            outcomes[str(result.status)] += 1
+        return outcomes
 
     async def _sweep_expired_submitting(self, session: AsyncSession) -> int:
         async with session.begin():

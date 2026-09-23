@@ -72,6 +72,16 @@ class Repository:
         self.message.claimed_by = claimed_by
         return self.message
 
+    async def start_attempt(self, session, message_id, *, claimed_by, lease_seconds):
+        if (
+            self.message is None
+            or self.message.id != message_id
+            or self.message.status != "submitting"
+            or self.message.claimed_by != claimed_by
+        ):
+            return None
+        return self.message
+
     async def mark_sent(
         self,
         session,

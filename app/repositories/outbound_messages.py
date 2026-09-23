@@ -136,6 +136,37 @@ class OutboundMessageRepository:
         )
         return list((await session.execute(statement)).scalars().all())
 
+    async def start_attempt(
+        self,
+        session: AsyncSession,
+        message_id: UUID,
+        *,
+        claimed_by: str,
+        lease_seconds: int,
+    ) -> OutboundMessage | None:
+        """Confirm, immediately before a provider call, that this claimant
+        still holds an unexpired ``submitting`` claim, and restart its lease.
+
+        Returns ``None`` if the row is no longer ``submitting``, was claimed
+        by someone else, or its lease already lapsed (a sweeper may be moving
+        it to ``uncertain``); the caller must then NOT contact the provider.
+        On success the full lease starts now, so a lease can never expire
+        before the provider attempt it protects has begun.
+        """
+        now = datetime.now(UTC)
+        statement = (
+            update(OutboundMessage)
+            .where(
+                OutboundMessage.id == message_id,
+                OutboundMessage.status == OutboundMessageStatus.SUBMITTING,
+                OutboundMessage.claimed_by == claimed_by,
+                OutboundMessage.claim_lease_expires_at > now,
+            )
+            .values(claim_lease_expires_at=now + timedelta(seconds=lease_seconds))
+            .returning(OutboundMessage)
+        )
+        return (await session.execute(statement)).scalar_one_or_none()
+
     async def sweep_expired_submitting(
         self,
         session: AsyncSession,

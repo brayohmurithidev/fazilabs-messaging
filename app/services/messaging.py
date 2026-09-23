@@ -404,6 +404,19 @@ class MessagingService:
         message: OutboundMessage,
         call_provider: ProviderCall,
     ) -> OutboundMessage:
+        async with session.begin():
+            started = await self.repository.start_attempt(
+                session,
+                message.id,
+                claimed_by=message.claimed_by,
+                lease_seconds=self.claim_lease_seconds,
+            )
+        if started is None:
+            logger.warning(
+                "outbound_attempt_not_started",
+                extra={"outbound_message_id": str(message.id), "claimed_by": message.claimed_by},
+            )
+            return await self._reload(session, message.id)
         now = datetime.now(UTC)
         try:
             provider_message_id = await call_provider()

@@ -734,3 +734,190 @@ async def test_concurrent_duplicate_idempotent_requests_produce_one_message_one_
     finally:
         await cleanup(sessions, application_id)
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# M0.1: a lease never expires before its provider attempt has started
+# ---------------------------------------------------------------------------
+
+
+async def seed_tagged_pending(sessions, application_id, count: int) -> list:
+    """Abandoned pending rows whose text body identifies them to a fake provider."""
+    old = datetime.now(UTC) - timedelta(seconds=200)
+    ids = [
+        await seed_message(sessions, application_id, status="pending", created_at=old)
+        for _ in range(count)
+    ]
+    async with sessions.begin() as session:
+        for message_id in ids:
+            message = await session.get(OutboundMessage, message_id)
+            message.text_body = f"tag:{message_id}"
+    return ids
+
+
+class InvariantCheckingProvider:
+    """Slow fake provider that records, at the instant of every provider
+    call, whether the row being submitted still held a live claim."""
+
+    def __init__(self, sessions, *, delay: float, fail_on_call: int | None = None) -> None:
+        self.sessions = sessions
+        self.delay = delay
+        self.fail_on_call = fail_on_call
+        self.calls: list = []
+        self.violations: list[str] = []
+
+    async def send_text_message(self, recipient, text):
+        message_id = text.removeprefix("tag:")
+        self.calls.append(message_id)
+        async with self.sessions() as session:
+            row = await session.get(OutboundMessage, message_id)
+        if row.status != "submitting" or row.claim_lease_expires_at <= datetime.now(UTC):
+            self.violations.append(f"{message_id}:{row.status}")
+        if self.fail_on_call == len(self.calls):
+            raise RuntimeError("simulated sweeper process crash mid-provider-call")
+        await asyncio.sleep(self.delay)
+        return WhatsAppSendResult(
+            recipient=recipient, meta_message_id=f"wamid.{message_id}", success=True
+        )
+
+
+async def test_slow_batch_with_overlapping_sweeper_never_attempts_an_expired_claim() -> None:
+    """Regression for the batch-wide lease: 5 rows x 0.4s sequential provider
+    time outlives a 1s lease. Under the old pre-claimed batch, the
+    overlapping sweeper moved not-yet-attempted rows to `uncertain` and the
+    first sweeper then submitted them anyway."""
+    engine, sessions = await database_sessions()
+    application_id = await seed_application(sessions)
+    ids = await seed_tagged_pending(sessions, application_id, 5)
+    provider = InvariantCheckingProvider(sessions, delay=0.4)
+    first = make_sweeper(provider, claim_lease_seconds=1)
+    expirer = make_sweeper(ExplodingProvider(), claim_lease_seconds=1)
+    done = asyncio.Event()
+
+    async def run_first():
+        try:
+            async with sessions() as session:
+                return await first.sweep_once(session)
+        finally:
+            done.set()
+
+    async def overlapping_expiry_sweeps():
+        expired = 0
+        while not done.is_set():
+            async with sessions() as session:
+                expired += await expirer._sweep_expired_submitting(session)
+            await asyncio.sleep(0.05)
+        return expired
+
+    try:
+        result, expired = await asyncio.gather(run_first(), overlapping_expiry_sweeps())
+        assert provider.violations == []
+        assert expired == 0
+        assert sorted(provider.calls) == sorted(str(i) for i in ids)
+        assert result.dispatched_from_pending == 5
+        assert result.dispatch_outcomes == {"sent": 5}
+        for message_id in ids:
+            message = await load(sessions, message_id)
+            assert message.status == "sent"
+            assert message.provider_message_id == f"wamid.{message_id}"
+    finally:
+        await cleanup(sessions, application_id)
+        await engine.dispose()
+
+
+async def test_two_full_sweepers_overlap_without_double_or_expired_submission() -> None:
+    engine, sessions = await database_sessions()
+    application_id = await seed_application(sessions)
+    ids = await seed_tagged_pending(sessions, application_id, 6)
+    provider = InvariantCheckingProvider(sessions, delay=0.2)
+    sweeper_a = make_sweeper(provider, claim_lease_seconds=1)
+    sweeper_b = make_sweeper(provider, claim_lease_seconds=1)
+    sweeper_b.sweeper_id = "sweeper:test-b"
+    sweeper_b.messaging_service.claim_identity = "sweeper:test-b"
+
+    async def sweep(sweeper):
+        async with sessions() as session:
+            return await sweeper.sweep_once(session)
+
+    try:
+        result_a, result_b = await asyncio.gather(sweep(sweeper_a), sweep(sweeper_b))
+        assert provider.violations == []
+        assert sorted(provider.calls) == sorted(str(i) for i in ids)
+        assert result_a.dispatched_from_pending + result_b.dispatched_from_pending == 6
+        for message_id in ids:
+            assert (await load(sessions, message_id)).status == "sent"
+    finally:
+        await cleanup(sessions, application_id)
+        await engine.dispose()
+
+
+@pytest.mark.parametrize("race", ["lease_already_expired", "expired_to_uncertain_by_other_sweeper"])
+async def test_dispatch_refuses_to_start_without_a_live_claim(race) -> None:
+    engine, sessions = await database_sessions()
+    application_id = await seed_application(sessions)
+    lease = -1 if race == "lease_already_expired" else 60
+    message_id = await seed_message(
+        sessions,
+        application_id,
+        status="submitting",
+        created_at=datetime.now(UTC) - timedelta(seconds=200),
+        claim_lease_expires_at=datetime.now(UTC) + timedelta(seconds=lease),
+        claimed_by="sweeper:test",
+    )
+    service = MessagingService(
+        ExplodingProvider(), claim_identity="sweeper:test", claim_lease_seconds=90
+    )
+    try:
+        async with sessions() as session:
+            async with session.begin():
+                stale_view = await session.get(OutboundMessage, message_id)
+            if race == "expired_to_uncertain_by_other_sweeper":
+                async with sessions.begin() as other:
+                    row = await other.get(OutboundMessage, message_id)
+                    row.status = OutboundMessageStatus.UNCERTAIN
+            result = await service.dispatch_claimed_from_row(session, stale_view)
+        expected = "submitting" if race == "lease_already_expired" else "uncertain"
+        assert result.status == expected
+        assert (await load(sessions, message_id)).status == expected
+    finally:
+        await cleanup(sessions, application_id)
+        await engine.dispose()
+
+
+async def test_crash_mid_sweep_leaves_only_the_in_flight_row_submitting() -> None:
+    engine, sessions = await database_sessions()
+    application_id = await seed_application(sessions)
+    ids = await seed_tagged_pending(sessions, application_id, 4)
+    provider = InvariantCheckingProvider(sessions, delay=0, fail_on_call=2)
+    sweeper = make_sweeper(provider)
+    try:
+        with pytest.raises(RuntimeError, match="simulated sweeper process crash"):
+            async with sessions() as session:
+                await sweeper.sweep_once(session)
+        statuses = sorted([(await load(sessions, i)).status for i in ids])
+        # One sent, the in-flight one durably `submitting` (never resent;
+        # expires to `uncertain`), the rest never claimed.
+        assert statuses == ["pending", "pending", "sent", "submitting"]
+        assert len(provider.calls) == 2
+    finally:
+        await cleanup(sessions, application_id)
+        await engine.dispose()
+
+
+async def test_backlog_larger_than_batch_drains_over_successive_sweeps() -> None:
+    engine, sessions = await database_sessions()
+    application_id = await seed_application(sessions)
+    ids = await seed_tagged_pending(sessions, application_id, 7)
+    provider = InvariantCheckingProvider(sessions, delay=0)
+    sweeper = make_sweeper(provider, batch_size=3)
+    try:
+        counts = []
+        for _ in range(3):
+            async with sessions() as session:
+                counts.append((await sweeper.sweep_once(session)).dispatched_from_pending)
+        assert counts == [3, 3, 1]
+        assert len(provider.calls) == 7
+        assert {(await load(sessions, i)).status for i in ids} == {"sent"}
+    finally:
+        await cleanup(sessions, application_id)
+        await engine.dispose()
