@@ -6,6 +6,7 @@ import pytest
 
 from app import cli
 from app.cli import _schema, parser
+from app.services import provider_egress
 from app.services.advanta_client import AdvantaAPIError, AdvantaBalance
 
 
@@ -53,7 +54,7 @@ async def test_advanta_balance_cli_prints_only_parsed_credit(monkeypatch, capsys
         async def get_balance(self):
             return AdvantaBalance(Decimal("800.00"))
 
-    monkeypatch.setattr(cli, "AdvantaClient", Client)
+    monkeypatch.setattr(provider_egress, "AdvantaClient", Client)
     monkeypatch.setattr(
         cli,
         "get_settings",
@@ -62,6 +63,10 @@ async def test_advanta_balance_cli_prints_only_parsed_credit(monkeypatch, capsys
             advanta_api_key=object(),
             advanta_partner_id=object(),
             advanta_sender_id="FAZILABS",
+            whatsapp_api_version=None,
+            whatsapp_phone_number_id=None,
+            whatsapp_access_token=None,
+            live_provider_sends_allowed=True,
         ),
     )
     await cli.advanta_balance(argparse.Namespace())
@@ -77,7 +82,7 @@ async def test_advanta_balance_cli_surfaces_sanitized_provider_error(monkeypatch
         async def get_balance(self):
             raise AdvantaAPIError("Advanta balance request failed: invalid credentials (code 1006)")
 
-    monkeypatch.setattr(cli, "AdvantaClient", Client)
+    monkeypatch.setattr(provider_egress, "AdvantaClient", Client)
     monkeypatch.setattr(
         cli,
         "get_settings",
@@ -86,6 +91,10 @@ async def test_advanta_balance_cli_surfaces_sanitized_provider_error(monkeypatch
             advanta_api_key=object(),
             advanta_partner_id=object(),
             advanta_sender_id="FAZILABS",
+            whatsapp_api_version=None,
+            whatsapp_phone_number_id=None,
+            whatsapp_access_token=None,
+            live_provider_sends_allowed=True,
         ),
     )
     with pytest.raises(SystemExit, match="invalid credentials"):

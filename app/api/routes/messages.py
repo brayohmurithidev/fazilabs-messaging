@@ -16,7 +16,6 @@ from app.schemas.messages import (
     TemplateMessageRequest,
     TextMessageRequest,
 )
-from app.services.advanta_client import AdvantaClient
 from app.services.billing import (
     AmbiguousPricingRuleError,
     BillingAccountNotFoundError,
@@ -33,7 +32,7 @@ from app.services.messaging import (
     TemplateParameterError,
     TemplateUnavailableError,
 )
-from app.services.whatsapp_client import WhatsAppCloudAPIClient
+from app.services.provider_egress import build_provider_clients
 
 router = APIRouter(prefix="/api/v1/messages", tags=["Messages"])
 
@@ -88,30 +87,10 @@ def billing_http_error(exc: Exception) -> HTTPException:
 
 def get_messaging_service(request: Request) -> MessagingService:
     settings = request.app.state.settings
-    whatsapp = None
-    if all(
-        (
-            settings.whatsapp_api_version,
-            settings.whatsapp_phone_number_id,
-            settings.whatsapp_access_token,
-        )
-    ):
-        whatsapp = WhatsAppCloudAPIClient(
-            api_version=settings.whatsapp_api_version,
-            phone_number_id=settings.whatsapp_phone_number_id,
-            access_token=settings.whatsapp_access_token,
-        )
-    advanta = None
-    if settings.advanta_base_url and settings.advanta_api_key and settings.advanta_partner_id:
-        advanta = AdvantaClient(
-            base_url=settings.advanta_base_url,
-            api_key=settings.advanta_api_key,
-            partner_id=settings.advanta_partner_id,
-            sender_id=settings.advanta_sender_id,
-        )
+    providers = build_provider_clients(settings)
     return MessagingService(
-        whatsapp,
-        advanta_client=advanta,
+        providers.whatsapp,
+        advanta_client=providers.advanta,
         advanta_provider_cost_per_page_minor=settings.advanta_provider_cost_per_page_minor,
         claim_lease_seconds=settings.dispatch_claim_lease_seconds,
     )

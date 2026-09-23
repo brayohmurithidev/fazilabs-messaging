@@ -45,9 +45,24 @@ class Settings(BaseSettings):
     dispatch_claim_lease_seconds: int = Field(default=90, ge=1)
     dispatch_pending_grace_seconds: int = Field(default=60, ge=1)
     dispatch_sweep_batch_size: int = Field(default=25, ge=1)
+    # Credentials being present is never permission to reach a live provider.
+    # Unset: allowed in staging/production, blocked in development/test.
+    allow_live_provider_sends: bool | None = None
+
+    @property
+    def live_provider_sends_allowed(self) -> bool:
+        if self.environment is Environment.TEST:
+            return False
+        if self.environment is Environment.DEVELOPMENT:
+            return self.allow_live_provider_sends is True
+        return self.allow_live_provider_sends is not False
 
     @model_validator(mode="after")
     def validate_environment(self) -> "Settings":
+        if self.environment is Environment.TEST and self.allow_live_provider_sends:
+            raise ValueError(
+                "APP_ALLOW_LIVE_PROVIDER_SENDS cannot be enabled in the test environment"
+            )
         if self.environment in {Environment.STAGING, Environment.PRODUCTION}:
             if self.database_url is None:
                 raise ValueError("APP_DATABASE_URL is required in staging and production")

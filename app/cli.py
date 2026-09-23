@@ -26,7 +26,7 @@ from app.models.message_template import MessageTemplate
 from app.models.messaging_application import MessagingApiKey, MessagingApplication
 from app.models.reconciliation import BillingException, MessageReconciliationAttempt
 from app.models.whatsapp_outbound_message import OutboundMessage
-from app.services.advanta_client import AdvantaAPIError, AdvantaClient
+from app.services.advanta_client import AdvantaAPIError
 from app.services.billing import (
     BillingService,
     CurrencyMismatchError,
@@ -42,6 +42,11 @@ from app.services.billing_exceptions import (
 )
 from app.services.dispatch_sweeper import DispatchSweeper
 from app.services.messaging import MessagingService
+from app.services.provider_egress import (
+    LiveProviderEgressBlockedError,
+    build_provider_clients,
+    require_live_provider_egress,
+)
 from app.services.reconciliation import (
     InvalidReconciliationTransitionError,
     ProviderMessageIdRequiredError,
@@ -55,7 +60,6 @@ from app.services.template_parameters import (
     semantic_parameter_names,
     validate_parameter_schema,
 )
-from app.services.whatsapp_client import WhatsAppCloudAPIClient
 
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEMPLATE_KEY_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
@@ -605,18 +609,13 @@ async def list_pricing_rules(args: argparse.Namespace) -> None:
 
 async def advanta_balance(args: argparse.Namespace) -> None:
     settings = get_settings()
-    if (
-        not settings.advanta_base_url
-        or not settings.advanta_api_key
-        or not settings.advanta_partner_id
-    ):
+    try:
+        require_live_provider_egress(settings)
+    except LiveProviderEgressBlockedError as exc:
+        raise SystemExit(str(exc)) from exc
+    client = build_provider_clients(settings).advanta
+    if client is None:
         raise SystemExit("Advanta provider is not configured")
-    client = AdvantaClient(
-        base_url=settings.advanta_base_url,
-        api_key=settings.advanta_api_key,
-        partner_id=settings.advanta_partner_id,
-        sender_id=settings.advanta_sender_id,
-    )
     try:
         result = await client.get_balance()
     except AdvantaAPIError as exc:
@@ -887,30 +886,10 @@ async def resolve_billing_exception(args: argparse.Namespace) -> None:
 
 
 def _messaging_service_from_settings(settings, *, claim_identity: str) -> MessagingService:
-    whatsapp = None
-    if all(
-        (
-            settings.whatsapp_api_version,
-            settings.whatsapp_phone_number_id,
-            settings.whatsapp_access_token,
-        )
-    ):
-        whatsapp = WhatsAppCloudAPIClient(
-            api_version=settings.whatsapp_api_version,
-            phone_number_id=settings.whatsapp_phone_number_id,
-            access_token=settings.whatsapp_access_token,
-        )
-    advanta = None
-    if settings.advanta_base_url and settings.advanta_api_key and settings.advanta_partner_id:
-        advanta = AdvantaClient(
-            base_url=settings.advanta_base_url,
-            api_key=settings.advanta_api_key,
-            partner_id=settings.advanta_partner_id,
-            sender_id=settings.advanta_sender_id,
-        )
+    providers = build_provider_clients(settings)
     return MessagingService(
-        whatsapp,
-        advanta_client=advanta,
+        providers.whatsapp,
+        advanta_client=providers.advanta,
         advanta_provider_cost_per_page_minor=settings.advanta_provider_cost_per_page_minor,
         claim_identity=claim_identity,
         claim_lease_seconds=settings.dispatch_claim_lease_seconds,
@@ -924,6 +903,12 @@ async def dispatch_sweep(args: argparse.Namespace) -> None:
     single bounded pass and exits rather than looping itself.
     """
     settings = get_settings()
+    # A blocked sweep would claim abandoned `pending` rows and, with no client,
+    # record them `uncertain`; refuse instead of mutating local state.
+    try:
+        require_live_provider_egress(settings)
+    except LiveProviderEgressBlockedError as exc:
+        raise SystemExit(str(exc)) from exc
     sweeper_id = f"sweeper-cli:{uuid4().hex[:12]}"
     messaging_service = _messaging_service_from_settings(settings, claim_identity=sweeper_id)
     sweeper = DispatchSweeper(

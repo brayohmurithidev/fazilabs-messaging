@@ -432,8 +432,23 @@ environment, not source control.
 | `APP_ADVANTA_PARTNER_ID` | Advanta partner credential |
 | `APP_ADVANTA_SENDER_ID` | Server-owned Advanta sender ID |
 | `APP_ADVANTA_PROVIDER_COST_PER_PAGE_MINOR` | Nullable trusted provider-cost snapshot per SMS page |
+| `APP_ALLOW_LIVE_PROVIDER_SENDS` | Live Meta/Advanta egress switch; see below |
 | `APP_BILLING_UNCERTAIN_RECONCILE_AFTER_MINUTES` | Safety age used by stale reconciliation operations |
 | `APP_TEST_DATABASE_URL` | Test-only isolated PostgreSQL URL consumed by integration tests |
+
+Configured provider credentials are never, by themselves, permission to contact Meta or Advanta.
+Live provider clients are built only in `app/services/provider_egress.py`, which both the HTTP API
+and the CLI use:
+
+| `APP_ENVIRONMENT` | `APP_ALLOW_LIVE_PROVIDER_SENDS` unset | `true` | `false` |
+| --- | --- | --- | --- |
+| `test` | blocked | rejected at startup | blocked |
+| `development` | blocked | allowed | blocked |
+| `staging` / `production` | allowed | allowed | blocked |
+
+When blocked, send endpoints return `503` before persisting a message, and the `dispatch-sweep`
+and `advanta-balance` commands exit without contacting a provider. Settings still load `.env`, so
+overriding only some variables inline keeps the `.env` credentials but not live egress.
 
 Production/staging settings currently validate all Meta credentials even if only SMS is intended.
 Advanta settings are optional at startup; an SMS attempt returns provider-unavailable if incomplete.
