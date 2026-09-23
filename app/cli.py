@@ -1,7 +1,9 @@
 import argparse
 import asyncio
 import json
+import logging
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -14,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.api_keys import generate_api_key
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 from app.db.session import async_session_factory
 from app.models.billing import (
     BillingAccount,
@@ -60,6 +63,9 @@ from app.services.template_parameters import (
     semantic_parameter_names,
     validate_parameter_schema,
 )
+
+# Explicit name: under `python -m app.cli` __name__ is "__main__".
+logger = logging.getLogger("app.cli")
 
 SLUG_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 TEMPLATE_KEY_PATTERN = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)*")
@@ -899,17 +905,22 @@ def _messaging_service_from_settings(settings, *, claim_identity: str) -> Messag
 async def dispatch_sweep(args: argparse.Namespace) -> None:
     """Run one recovery pass: dispatch abandoned `pending` rows, and move
     lease-expired `submitting` rows to `uncertain`. Intended to be invoked
-    repeatedly by an external scheduler (cron/systemd timer); it performs a
-    single bounded pass and exits rather than looping itself.
+    repeatedly by an external scheduler (see deployment/systemd); it performs
+    a single bounded pass and exits rather than looping itself. Exits
+    non-zero when refused by the provider-egress guard or when the pass fails.
     """
     settings = get_settings()
+    sweeper_id = f"sweeper-cli:{uuid4().hex[:12]}"
     # A blocked sweep would claim abandoned `pending` rows and, with no client,
     # record them `uncertain`; refuse instead of mutating local state.
     try:
         require_live_provider_egress(settings)
     except LiveProviderEgressBlockedError as exc:
+        logger.error(
+            "dispatch_sweep_refused",
+            extra={"sweeper_id": sweeper_id, "error_type": type(exc).__name__},
+        )
         raise SystemExit(str(exc)) from exc
-    sweeper_id = f"sweeper-cli:{uuid4().hex[:12]}"
     messaging_service = _messaging_service_from_settings(settings, claim_identity=sweeper_id)
     sweeper = DispatchSweeper(
         messaging_service,
@@ -918,8 +929,32 @@ async def dispatch_sweep(args: argparse.Namespace) -> None:
         claim_lease_seconds=settings.dispatch_claim_lease_seconds,
         batch_size=settings.dispatch_sweep_batch_size,
     )
-    async with async_session_factory() as session:
-        result = await sweeper.sweep_once(session)
+    started = time.monotonic()
+    try:
+        async with async_session_factory() as session:
+            result = await sweeper.sweep_once(session)
+    except Exception as exc:
+        # Type only: exception text can carry SQL parameters. Exit non-zero so
+        # the scheduler records the failed run.
+        logger.error(
+            "dispatch_sweep_failed",
+            extra={
+                "sweeper_id": sweeper_id,
+                "error_type": type(exc).__name__,
+                "duration_ms": round((time.monotonic() - started) * 1000),
+            },
+        )
+        raise SystemExit(1) from None
+    logger.info(
+        "dispatch_sweep_completed",
+        extra={
+            "sweeper_id": sweeper_id,
+            "dispatched_from_pending": result.dispatched_from_pending,
+            "expired_submitting_to_uncertain": result.expired_submitting_to_uncertain,
+            "dispatch_outcomes": result.dispatch_outcomes,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        },
+    )
     print(f"Dispatched from abandoned pending: {result.dispatched_from_pending}")
     print(f"Expired submitting -> uncertain: {result.expired_submitting_to_uncertain}")
 
@@ -1154,6 +1189,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    configure_logging(get_settings().log_level)
     asyncio.run(args.handler(args))
 
 

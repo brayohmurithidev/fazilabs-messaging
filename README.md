@@ -266,6 +266,7 @@ Example prices in this README are test-only, never production/commercial pricing
 Public message states are:
 
 - `pending`: persisted before provider submission;
+- `submitting`: claimed for exactly one provider attempt, which may be in flight;
 - `sent`: the provider accepted the submission;
 - `delivered`: a provider callback reported terminal delivery;
 - `read`: a WhatsApp callback reported that the recipient read it;
@@ -273,10 +274,11 @@ Public message states are:
 - `uncertain`: provider acceptance could not safely be determined.
 
 ```text
-pending ── accepted ──> sent ── callback ──> delivered ── WhatsApp callback ──> read
-   │
-   ├── confirmed rejection ──> failed (customer reservation released)
-   └── ambiguous outcome ────> uncertain (reservation retained; operator reconciliation)
+pending ── claim ──> submitting ── accepted ──> sent ── callback ──> delivered ── WhatsApp callback ──> read
+                        │
+                        ├── confirmed rejection ──> failed (customer reservation released)
+                        ├── ambiguous outcome ────> uncertain (reservation retained; operator reconciliation)
+                        └── claim lease expired ──> uncertain (via dispatch recovery; never resent)
 ```
 
 An uncertain message is never blindly submitted again. Exact idempotent replay returns its existing
@@ -372,6 +374,8 @@ Run `uv run python -m app.cli --help` and per-command `--help` for complete flag
   `monthly-usage-summary`.
 - Pricing: `create-pricing-rule`, `list-pricing-rules`, `disable-pricing-rule`.
 - Advanta operator balance: `advanta-balance`. This is provider credit, not a customer wallet.
+- Dispatch recovery: `dispatch-sweep` runs one bounded recovery pass (see
+  [Dispatch recovery sweeper](#dispatch-recovery-sweeper)); production runs it from a systemd timer.
 - Uncertain messages: `list-uncertain-messages` (all by default),
   `list-uncertain-messages --stale-only`, `show-uncertain-message`,
   `reconcile-uncertain-message`, `release-uncertain-reservation`.
@@ -486,7 +490,8 @@ limit, and provides bounded edge request rates. `messaging.fazicore.app` exposes
 paths are placeholders; this repository does not provision DNS or certificates.
 
 Do not run multiple migration jobs concurrently. The service has no startup migration, queue worker,
-scheduler, or local persistent-data requirement. PostgreSQL is the system of record and needs
+or local persistent-data requirement. It does require the dispatch recovery timer described in
+[Dispatch recovery sweeper](#dispatch-recovery-sweeper). PostgreSQL is the system of record and needs
 managed backups and restore testing.
 
 Before production, configure Meta's callback as
@@ -495,6 +500,60 @@ Before production, configure Meta's callback as
 traffic admission/readiness. The selected platform must aggregate JSON stdout/stderr logs and alert
 on API errors, provider failures, uncertain messages, billing exceptions, database health, and
 webhook failure or silence.
+
+## Dispatch recovery sweeper
+
+Every send is persisted as `pending`, claimed as `submitting` for exactly one provider attempt, then
+recorded with its outcome. If the API process dies between those steps, the row is stranded:
+
+- a `pending` row older than `APP_DISPATCH_PENDING_GRACE_SECONDS` (60) was never submitted, so it
+  is safe to submit exactly once;
+- a `submitting` row whose claim lease (`APP_DISPATCH_CLAIM_LEASE_SECONDS`, 90) expired may or may
+  not have reached the provider, so it becomes `uncertain` and is **never** submitted again.
+
+`dispatch-sweep` performs one bounded pass of both. It claims and dispatches abandoned `pending` rows
+one at a time (at most `APP_DISPATCH_SWEEP_BATCH_SIZE`, 25, per pass), each immediately before its
+own provider attempt, and re-verifies the claim right before calling the provider. A lease can
+therefore never expire before its provider attempt has started, whatever the batch size or provider
+timeout. Concurrent passes are safe: rows are claimed with `SKIP LOCKED` and every status change is
+compare-and-swap. Nothing performs this recovery unless the sweep runs, so production must schedule
+it.
+
+Scheduling uses [`deployment/systemd`](deployment/systemd/README.md):
+
+- `fazilabs-messaging-dispatch-sweep.service`: a oneshot running
+  `.venv/bin/python -m app.cli dispatch-sweep` as the API's user, from the API's checkout, with the
+  API's `EnvironmentFile`. It contains no secrets.
+- `fazilabs-messaging-dispatch-sweep.timer`: starts it about once per minute. systemd does not start a
+  run while the previous one is still active, and `Persistent=true` runs one catch-up pass after
+  downtime.
+
+The sweep contacts providers, so it obeys the same provider-egress rule as the API: it refuses and
+exits non-zero in `test`, and in `development` unless `APP_ALLOW_LIVE_PROVIDER_SENDS=true`. Because it
+reads the API's `.env`, production behavior matches the API's.
+
+Operations on the host:
+
+```bash
+systemctl list-timers fazilabs-messaging-dispatch-sweep.timer   # last and next run
+systemctl status fazilabs-messaging-dispatch-sweep.service      # last run result
+journalctl -u fazilabs-messaging-dispatch-sweep.service --since "1 hour ago"
+```
+
+Each pass logs one JSON `dispatch_sweep_completed` event (`dispatched_from_pending`,
+`expired_submitting_to_uncertain`, `dispatch_outcomes`, `duration_ms`), or `dispatch_sweep_failed`
+(`error_type` only) / `dispatch_sweep_refused` with a non-zero exit, which leaves the service
+`failed` until the next successful pass. Alert when no `dispatch_sweep_completed` event appears for
+several minutes, on repeated failures, and on any `expired_submitting_to_uncertain` above zero.
+
+Rows moved to `uncertain` appear in `list-uncertain-messages`. **Never resend an uncertain message
+blindly** (for example with a new idempotency key): the provider may already have accepted it. Use
+`show-uncertain-message` and provider evidence, then `reconcile-uncertain-message`.
+
+To pause recovery safely, run `sudo systemctl stop fazilabs-messaging-dispatch-sweep.timer` (add
+`disable` to keep it off across reboots). Stopping only pauses recovery: stranded rows stay as they
+are until it resumes. Do not kill a running pass unless it is hung; if you do, at most the one row
+it was submitting becomes `uncertain` after its lease.
 
 ## Security and operational notes
 
@@ -518,7 +577,7 @@ webhook failure or silence.
 ## Current limitations and future work
 
 - Advanta DLR callbacks lack provider-verified authentication in the available contract.
-- There is no bulk send, automatic cross-channel fallback, queue/scheduler, or automatic uncertain
+- There is no bulk send, automatic cross-channel fallback, queue, or automatic uncertain
   reconciliation.
 - There is no built-in application rate limiting or deployment manifest/container image.
 - Provider delivery-report polling exists as a client capability but no polling daemon is included.

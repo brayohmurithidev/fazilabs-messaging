@@ -1,0 +1,15 @@
+# Runs fazilabs-messaging-dispatch-sweep.service about once per minute.
+# systemd never starts a unit that is still running, so passes on this host
+# cannot overlap; Persistent= runs one catch-up pass after downtime.
+
+[Unit]
+Description=Run Fazilabs Messaging dispatch recovery about once per minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=5s
+Persistent=true
+Unit=fazilabs-messaging-dispatch-sweep.service
+
+[Install]
+WantedBy=timers.target

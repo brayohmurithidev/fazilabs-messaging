@@ -37,6 +37,17 @@ class JsonFormatter(logging.Formatter):
         ):
             if value := getattr(record, field, None):
                 payload[field] = value
+        # Operational counters: zero is meaningful, so only omit when absent.
+        for field in (
+            "sweeper_id",
+            "dispatched_from_pending",
+            "expired_submitting_to_uncertain",
+            "dispatch_outcomes",
+            "duration_ms",
+            "error_type",
+        ):
+            if (value := getattr(record, field, None)) is not None:
+                payload[field] = value
         return json.dumps(payload)
 
 

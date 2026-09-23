@@ -1,0 +1,28 @@
+# One bounded Fazilabs Messaging dispatch-recovery pass, triggered by
+# fazilabs-messaging-dispatch-sweep.timer. Runs as the same user, from the
+# same checkout, with the same EnvironmentFile as fazilabs-messaging.service,
+# so it follows production's provider-egress configuration exactly. Contains
+# no secrets. See README "Dispatch recovery sweeper".
+
+[Unit]
+Description=Fazilabs Messaging dispatch recovery sweep
+Documentation=file:///home/dev/app/fazilabs-messaging/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dev
+Group=dev
+WorkingDirectory=/home/dev/app/fazilabs-messaging
+EnvironmentFile=/home/dev/app/fazilabs-messaging/.env
+ExecStart=/home/dev/app/fazilabs-messaging/.venv/bin/python -m app.cli dispatch-sweep
+# A pass handles at most APP_DISPATCH_SWEEP_BATCH_SIZE rows one at a time; a
+# pass still running after this is hung (e.g. a stalled DB connection). Being
+# killed leaves at most one row `submitting`, which later expires to
+# `uncertain` and is never resent.
+TimeoutStartSec=10min
+KillSignal=SIGTERM
+SyslogIdentifier=fazilabs-messaging-dispatch-sweep
+NoNewPrivileges=true
+PrivateTmp=true
